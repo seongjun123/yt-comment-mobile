@@ -18,6 +18,9 @@ const accounts = {
 };
 let pick = "me";            // 다음 로그인에서 고를 계정
 let silentFails = false;    // prompt=none 실패 흉내
+let forceSilentKey = null;  // 자동 갱신이 다른 채널로 돌아오는 경우 흉내
+let nextExpires = null;     // 다음 로그인 토큰의 유효 시간(초) 한 번만 바꾸기
+const silentHints = [];
 let tokenSeq = 0;
 const tokenOwner = {};      // token → 계정 키
 
@@ -61,21 +64,23 @@ async function installMocks(page) {
     const u = new URL(route.request().url());
     const p = u.searchParams;
     const redirect = p.get("redirect_uri"), state = p.get("state");
+    if (p.get("prompt") === "none") { silentHints.push(p.get("login_hint") || ""); if (process.env.DBG) console.log("SILENT", p.get("scope").includes("youtube") ? "channel" : "sheet", p.get("login_hint"), silentFails); }
     if (p.get("prompt") === "none" && silentFails) {
       return route.fulfill({ status: 302, headers: { location: `${redirect}#error=interaction_required&state=${state}` } });
     }
     const isSheet = !p.get("scope").includes("youtube");
-    const key = isSheet ? "sheet" : (p.get("prompt") === "none" ? (tokenOwner.lastChannelKey || pick) : pick);
+    const key = isSheet ? "sheet" : (p.get("prompt") === "none" ? (forceSilentKey || tokenOwner.lastChannelKey || pick) : pick);
     const tok = `${accounts[key].token}-${++tokenSeq}`;
     tokenOwner[tok] = key;
     if (!isSheet) tokenOwner.lastChannelKey = key;
-    const frag = new URLSearchParams({ access_token: tok, expires_in: "3599", token_type: "Bearer", scope: p.get("scope").replace("openid email", "openid https://www.googleapis.com/auth/userinfo.email"), state });
+    const frag = new URLSearchParams({ access_token: tok, expires_in: String(nextExpires || 3599), token_type: "Bearer", scope: p.get("scope").replace("openid email", "openid https://www.googleapis.com/auth/userinfo.email"), state });
+    nextExpires = null;
     route.fulfill({ status: 302, headers: { location: `${redirect}#${frag}` } });
   });
   await page.route("https://openidconnect.googleapis.com/**", (route) => {
     const k = who(route.request());
     if (!k) return json(route, 401, {});
-    json(route, 200, { email: accounts[k].email || undefined });
+    json(route, 200, { email: accounts[k].email || undefined, sub: "sub-" + k });
   });
   await page.route("https://www.googleapis.com/youtube/v3/**", (route) => {
     const req = route.request(), u = new URL(req.url()), k = who(req);
@@ -240,29 +245,72 @@ await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textConten
 check("자동 갱신 후 이어서 게시", posted.length === n0 + 1 && posted.at(-1).text === "자동 갱신 테스트", String(posted.length - n0));
 await page.click("#dlgOk");
 
-// 8) 자동 갱신 실패 → 배너 → 수동 로그인 → 이어서 게시
-grid.push(mk("B", "무인도", "HuaGOfzVBiU", "수동 갱신 테스트"));
-await page.evaluate(() => {
+// 8) 로그인 유지: 앱을 열 때 토큰이 끝나 있으면 누르지 않아도 자동 갱신 (브랜드 채널은 sub로 지정)
+const expire = (ms) => page.evaluate((ms) => {
   const ch = JSON.parse(localStorage.getItem("ytm.channels"));
   const cur = JSON.parse(localStorage.getItem("ytm.current"));
-  ch[cur].exp = Date.now() + 2 * 60 * 1000;
+  ch[cur].exp = Date.now() + ms;
   localStorage.setItem("ytm.channels", JSON.stringify(ch));
-});
+  localStorage.removeItem("ytm.silentTry");
+}, ms);
+await expire(-60 * 60e3);                     // 1시간 전에 만료
+const hintsBefore = silentHints.length;
 await page.reload();
-await page.waitForSelector(".item");
+await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
+check("열 때 자동 갱신 (버튼 안 누름)", silentHints.length === hintsBefore + 1);
+check("브랜드 채널은 sub로 자동 갱신", silentHints.at(-1) === "sub-brand", silentHints.at(-1));
+check("자동 갱신 후 채널 유지", (await page.textContent("#acctTitle")) === "또이안이야");
+check("자동 갱신 후 주소창 깨끗", !page.url().includes("#"), page.url());
+
+// 8-2) 자동 갱신 실패 → 무한 반복 없이 배너, 수동 로그인 후 이어서 게시
+grid.push(mk("B", "무인도", "HuaGOfzVBiU", "수동 갱신 테스트"));
+await expire(-60e3);
 silentFails = true;
+const h2 = silentHints.length;
+await page.reload();
+await page.waitForSelector("#authBanner:not(.hidden)", { timeout: 10000 });
+await page.waitForTimeout(1500);
+check("자동 갱신 실패 시 1번만 시도", silentHints.length === h2 + 1, String(silentHints.length - h2));
+await page.screenshot({ path: `${OUT}/06-relogin-banner.png` });
+silentFails = false;
 const n1 = posted.length;
+await page.click("#btnStart").catch(() => {});      // 만료 상태라 비활성일 수 있음
+await page.click("#btnRelogin");
+await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
+await page.waitForSelector(".item");
 await page.click("#btnStart");
 await page.waitForSelector("#dlgConfirm[open]");
 await page.click("#dlgOk");
-await page.waitForSelector("#authBanner:not(.hidden)", { timeout: 10000 });
-await page.screenshot({ path: `${OUT}/06-relogin-banner.png` });
-check("자동 갱신 실패 시 배너", true);
-silentFails = false;
-await page.click("#btnRelogin");
 await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
-check("수동 로그인 후 이어서 게시", posted.length === n1 + 1 && posted.at(-1).text === "수동 갱신 테스트", String(posted.length - n1));
+check("수동 로그인 후 게시", posted.length === n1 + 1 && posted.at(-1).text === "수동 갱신 테스트", String(posted.length - n1));
 await page.click("#dlgOk");
+
+// 8-3) 시작 버튼을 눌렀을 때 곧 만료면: 갱신 → 돌아와서 확인 창 → 게시
+grid.push(mk("C", "C 영상", "CCCCCCCCCCC", "시작 시 갱신 테스트"));
+nextExpires = 186;                            // 3분 6초짜리 토큰으로 로그인 → 몇 초 뒤 '곧 만료'
+await page.click("#btnLogin");
+await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
+await page.waitForSelector(".item");
+await page.waitForTimeout(7000);
+const n2 = posted.length, h3 = silentHints.length;
+await page.click("#btnStart");
+await page.waitForSelector("#dlgConfirm[open]", { timeout: 10000 });
+check("시작 시 자동 갱신 후 확인 창", silentHints.length === h3 + 1 && (await page.textContent("#dlgTitle")) === "게시할까요?");
+await page.click("#dlgOk");
+await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
+check("갱신 후 게시", posted.length === n2 + 1, String(posted.length - n2));
+await page.click("#dlgOk");
+
+// 8-4) 자동 갱신이 다른 채널로 돌아오면 원래 채널 유지 + 배너
+await expire(-60e3);
+forceSilentKey = "me";
+await page.reload();
+await page.waitForSelector("#authBanner:not(.hidden)", { timeout: 10000 });
+check("다른 채널로 갱신돼도 원래 채널 유지", (await page.textContent("#acctTitle")) === "또이안이야");
+forceSilentKey = null;
+await page.click("#btnRelogin");
+await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
+await page.waitForSelector(".item, #emptyMsg:not(.hidden)");
 
 // 9) 공개 확인: 5분 지난 댓글 1차, 24시간 지난 댓글 2차
 const kst = (msAgo) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(Date.now() - msAgo));

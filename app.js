@@ -1,8 +1,8 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js?v=1.1.0";
-import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.1.0";
+import * as L from "./lib.js?v=1.2.0";
+import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.2.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
@@ -154,14 +154,14 @@ async function finishLogin(r) {
   S.needLogin = null;
   if (r.kind === "sheet") {
     if (!r.scopes.includes(SCOPE_SHEETS)) throw new Error("시트 권한이 허용되지 않았습니다. 다시 로그인해서 모든 권한을 허용해주세요.");
-    const email = await fetchEmail(r.token);
-    S.sheetAuth = { token: r.token, exp: r.exp, email };
+    const { email, sub } = await fetchIdentity(r.token);
+    S.sheetAuth = { token: r.token, exp: r.exp, email, sub };
     persist();
     toast(`시트 계정: ${email || "로그인됨"}`);
     return;
   }
   if (!r.scopes.includes(SCOPE_YT)) throw new Error("유튜브 권한이 허용되지 않았습니다. 다시 로그인해서 모든 권한을 허용해주세요.");
-  const email = await fetchEmail(r.token);
+  const { email, sub } = await fetchIdentity(r.token);
   const res = await api(`${YT}/channels?part=snippet&mine=true`, { token: r.token, exp: r.exp });
   const ch = res.items && res.items[0];
   if (!ch) throw new Error("선택한 계정에 유튜브 채널이 없습니다.");
@@ -170,31 +170,35 @@ async function finishLogin(r) {
   S.channels[ch.id] = {
     title: sn.title || ch.id, handle: sn.customUrl || "",
     thumb: (sn.thumbnails && (sn.thumbnails.default || sn.thumbnails.medium || {}).url) || "",
-    email, token: r.token, exp: r.exp,
+    email, sub, token: r.token, exp: r.exp,
   };
-  S.current = ch.id;
+  const wrongChannel = r.silent && prev && prev !== ch.id;
+  S.wrongChannel = !!wrongChannel;
+  if (!wrongChannel) S.current = ch.id;
   // 본계정 채널로 로그인했고 시트 권한이 있으면 시트 계정도 같이 채운다
   if (isRealEmail(email) && r.scopes.includes(SCOPE_SHEETS) && (!valid(S.sheetAuth) || S.sheetAuth.email === email)) {
-    S.sheetAuth = { token: r.token, exp: r.exp, email };
+    S.sheetAuth = { token: r.token, exp: r.exp, email, sub };
   }
   persist();
-  log("채널 로그인", sn.title, email ? "(" + email + ")" : "");
-  if (prev && prev !== ch.id && r.silent) {
-    // 자동 갱신했는데 다른 채널로 돌아옴 → 게시 이어가기 금지
-    const run = store.get("run", null);
-    if (run && run.channelId === prev) { store.del("run"); }
-    toast("다른 채널로 로그인되어 게시를 멈췄습니다. 채널을 확인하세요.", 6000);
+  log("채널 로그인", sn.title, email ? "(" + email + ")" : "", r.silent ? "(자동)" : "");
+  if (wrongChannel) {
+    // 자동 갱신했는데 다른 채널로 돌아옴 → 원래 채널 유지, 게시 이어가기 금지
+    store.del("run");
+    showAuthBanner("channel");
+    toast("자동 로그인이 다른 채널로 됐습니다. [다시 로그인]으로 원래 채널을 선택하세요.", 6000);
   } else if (!r.silent) {
     toast(`${sn.title} 채널로 로그인했습니다`);
   }
 }
 
-async function fetchEmail(token) {
+/** 로그인한 계정의 이메일과 고유 ID(sub). sub는 브랜드 채널 자동 재로그인(login_hint)에 쓴다. */
+async function fetchIdentity(token) {
   try {
     const r = await fetch("https://openidconnect.googleapis.com/v1/userinfo", { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) return "";
-    return (await r.json()).email || "";
-  } catch { return ""; }
+    if (!r.ok) return { email: "", sub: "" };
+    const j = await r.json();
+    return { email: j.email || "", sub: j.sub || "" };
+  } catch { return { email: "", sub: "" }; }
 }
 
 // ------------------------------------------------------------------ API
@@ -410,22 +414,59 @@ async function requestWake() {
 }
 function releaseWake() { try { S.wake && S.wake.release(); } catch { /* 무시 */ } S.wake = null; }
 
-/** 토큰이 곧 끝나면 실행 상태를 저장하고 자동 갱신(리디렉션). 페이지를 떠나면 true */
-function renewIfNeeded() {
-  const ch = channel(), st = sheetToken();
-  const soon = (t) => !t || t.exp - now() < RENEW_MARGIN_MS;
-  if (!soon(ch) && !soon(st)) return false;
-  store.set("run", { channelId: S.current, sheetId: S.currentSheet, at: now() });
-  if (soon(ch)) startLogin("channel", { silent: true, hint: isRealEmail(ch && ch.email) ? ch.email : "" });
-  else startLogin("sheet", { silent: true, hint: (S.sheetAuth && S.sheetAuth.email) || "" });
+// ------------------------------------------------------------------ 로그인 유지 (자동 갱신)
+// 구글 로그인 자체는 이 기기 브라우저에 남아 있으므로, 1시간짜리 토큰이 끝나면
+// 화면 없이(prompt=none) 새 토큰을 받아 온다. 브랜드 채널은 계정 고유 ID(sub)로 지정한다.
+const fresh = (t) => !!t && t.exp - now() > RENEW_MARGIN_MS;
+
+function hintFor(kind) {
+  if (kind === "sheet") { const a = S.sheetAuth; return a ? (a.email || a.sub || "") : ""; }
+  const c = channel();
+  return c ? (isRealEmail(c.email) ? c.email : (c.sub || "")) : "";
+}
+
+/** 어떤 토큰이 갱신이 필요한지: "channel" | "sheet" | null */
+function staleKind() {
+  const ch = channel();
+  if (ch && !fresh(ch)) return "channel";
+  // 시트는 별도 시트 계정이 있을 때만 (본계정 채널이면 채널 토큰을 같이 씀)
+  const usesOwn = S.sheetAuth && !(ch && isRealEmail(ch.email) && S.sheetAuth.email === ch.email);
+  if (usesOwn && !fresh(S.sheetAuth)) return "sheet";
+  return null;
+}
+
+/** 자동 갱신 시도. 같은 종류를 2분 안에 다시 시도하지 않는다(무한 반복 방지). 페이지를 떠나면 true */
+function trySilent(kind) {
+  if (!kind || S.leaving) return false;
+  const tries = store.get("silentTry", {});
+  if (now() - (tries[kind] || 0) < 2 * 60 * 1000) return false;
+  tries[kind] = now(); store.set("silentTry", tries);
+  startLogin(kind, { silent: true, hint: hintFor(kind) });
   return true;
+}
+
+/** 게시 도중 토큰이 곧 끝나면 실행 상태를 저장하고 자동 갱신. 페이지를 떠나면 true */
+function renewIfNeeded() {
+  const kind = staleKind();
+  if (!kind) return false;
+  store.set("run", { channelId: S.current, sheetId: S.currentSheet, at: now(), confirmed: true });
+  if (trySilent(kind)) return true;
+  return false;   // 방금 실패했으면 여기서는 그냥 진행(남은 시간 안에서), 만료되면 오류로 멈춤
 }
 
 async function startRun({ resumed = false } = {}) {
   if (S.running) return;
   const ch = channel();
-  if (!ch || !valid(ch)) { toast("먼저 로그인해주세요"); return; }
+  if (!ch) { toast("먼저 로그인해주세요"); return; }
   if (!S.sheet || S.sheet.error) { toast("시트를 먼저 불러와주세요"); return; }
+  const stale = staleKind();
+  if (stale) {
+    // 로그인을 새로 받아 온 뒤 이어서 (확인 창은 돌아와서 띄움)
+    store.set("run", { channelId: S.current, sheetId: S.currentSheet, at: now(), confirmed: resumed });
+    if (trySilent(stale)) return;
+    if (!valid(ch)) { showAuthBanner(stale); store.del("run"); return; }
+    store.del("run");
+  }
 
   // 1) 게시 중으로 남은 행 정리
   const orphans = S.sheet.items.filter((i) => i.kind === "orphan");
@@ -590,7 +631,7 @@ function renderAccount() {
   $("acctTitle").textContent = ch ? ch.title : "로그인이 필요합니다";
   if (ch) {
     const who = isRealEmail(ch.email) ? ch.email : "브랜드 채널";
-    const state = valid(ch) ? `${Math.max(1, Math.round((ch.exp - now()) / 60000))}분 남음` : "로그인 만료";
+    const state = valid(ch) ? "로그인 유지 중" : "로그인 갱신 필요";
     $("acctSub").textContent = `${ch.handle ? ch.handle + " · " : ""}${who} · ${state}`;
   } else {
     $("acctSub").textContent = "구글 계정 선택 → 게시할 채널 선택";
@@ -761,7 +802,8 @@ function bind() {
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      if (S.running) requestWake();
+      if (S.running) { requestWake(); return; }
+      if (trySilent(staleKind())) return;   // 오래 두었다가 다시 열면 자동으로 로그인 갱신
       renderAccount();
     }
   });
@@ -802,15 +844,20 @@ async function boot() {
     }
   }
   render();
+  // 로그인 유지: 토큰이 끝났거나 곧 끝나면 화면 없이 새로 받아 온다
+  const failedSilently = r && !r.ok && r.silent;
+  if (!failedSilently && trySilent(staleKind())) return;
+  if (r && r.ok && !S.wrongChannel) store.del("silentTry");   // 성공했으면 다음 갱신 제한 해제
+
   if (S.currentSheet && sheetToken()) await safeLoad();
   else if (S.currentSheet && channel()) showAuthBanner(valid(channel()) ? "sheet" : "channel");
 
   // 로그인 갱신 때문에 잠시 떠났던 실행 이어가기
   const run = store.get("run", null);
   if (run && r && r.ok && run.channelId === S.current && run.sheetId === S.currentSheet && now() - run.at < 3 * 60 * 60 * 1000 && S.sheet && !S.sheet.error) {
-    toast("게시를 이어갑니다");
-    startRun({ resumed: true }).catch(handleRunError);
-  } else if (run && !(r && !r.ok && r.silent)) {
+    if (run.confirmed) toast("게시를 이어갑니다");
+    startRun({ resumed: !!run.confirmed }).catch(handleRunError);
+  } else if (run && !failedSilently) {
     // 자동 갱신이 실패한 경우만 기록을 남겨 두고(수동 로그인 후 이어가기), 그 외에는 지운다
     store.del("run");
   }
