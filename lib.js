@@ -204,10 +204,8 @@ export function errorReason(status, body) {
   return { code: "other", message: (msg || `오류 ${status}`).slice(0, 150) };
 }
 
-// ------------------------------------------------------------------ 공개 확인 (로그인 없이 댓글이 보이는지)
-
-export const VIS_FIRST_MIN = 5;          // 게시 후 1차 확인까지 (분)
-export const VIS_SECOND_HOURS = 24;      // 게시 후 2차 확인까지 (시간)
+// ------------------------------------------------------------------ 공개 검사 (로그인 없이 댓글이 보이는지)
+// 업로드와 분리된 별도 기능. 시간 조건 없이, 시트에 남은 댓글링크를 지금 바로 검사한다.
 
 /** 댓글링크(…&lc=ID)에서 댓글 스레드 ID */
 export function commentIdFromLink(link) {
@@ -222,28 +220,68 @@ export function parseKst(stamp) {
   return Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || "00"}+09:00`);
 }
 
-/** 이 행에 지금 필요한 확인 단계: 1 | 2 | 0(필요 없음) */
-export function visibilityStage(item, nowMs = Date.now(), firstMin = VIS_FIRST_MIN, secondHours = VIS_SECOND_HOURS) {
-  if (item.kind !== "done" || !commentIdFromLink(item.link)) return 0;
-  const t = parseKst(item.postedAt);
-  if (!Number.isFinite(t)) return 0;
-  const age = nowMs - t;
-  const v = item.visibility || "";
-  if (!v) return age >= firstMin * 60 * 1000 ? 1 : 0;
-  if (v.startsWith("1차") && !v.includes("2차") && age >= secondHours * 3600 * 1000) return 2;
-  return 0;
+/**
+ * 시트 한 탭에서 검사할 행(댓글링크가 있는 행)을 뽑는다.
+ * 반환: { linkCol, visCol(-1이면 없음), rows: [{ row, cid, vid, link, text, title, channel, postedAt, postedBy, visibility }] }
+ * '댓글링크' 머리글이 없으면 null
+ */
+export function linkRows(header, rows) {
+  const cols = findColumns(header, rows);
+  const linkCol = cols.managed["댓글링크"];
+  if (linkCol < 0) return null;
+  const get = (r, i) => (i >= 0 && i < r.length && r[i] != null ? String(r[i]).trim() : "");
+  const out = [];
+  rows.forEach((r, i) => {
+    const link = get(r, linkCol);
+    const cid = commentIdFromLink(link);
+    if (!cid) return;
+    out.push({
+      row: i + 2, cid, link, vid: extractVideoId(link) || extractVideoId(get(r, cols.video)),
+      text: get(r, cols.comment), title: get(r, cols.title), channel: get(r, cols.channel),
+      postedAt: get(r, cols.managed["게시시각"]), postedBy: get(r, cols.managed["게시채널"]),
+      visibility: get(r, cols.managed["공개확인"]),
+    });
+  });
+  return { linkCol, visCol: cols.managed["공개확인"], rows: out };
 }
 
-/** 확인 결과를 '공개확인' 칸 문구로 */
-export function visibilityText(prev, stage, visible, nowMs = Date.now()) {
-  const when = kstStamp(new Date(nowMs)).slice(5, 16).replace("-", "/");   // "10/23 00:41"
-  const word = visible ? "보임" : "안 보임";
-  return stage === 1 ? `1차 ${word} (${when})` : `${prev} → 2차 ${word} (${when})`;
+/**
+ * 두 가지 조회 결과를 합쳐 판정.
+ *  byId: 댓글 ID로 직접 조회해서 나왔는지 (true/false)
+ *  inList: 영상의 '최신순' 공개 댓글 목록에 있었는지 (true/false/null=목록이 길어 거기까지 못 봄)
+ *  videoGone: 영상이 없거나 댓글이 꺼져 목록 조회 자체가 실패
+ * 반환: "visible" | "hidden" | "mixed" | "gone"
+ */
+export function visVerdict(byId, inList, videoGone = false) {
+  if (videoGone) return byId ? "mixed" : "gone";
+  if (inList == null) return byId ? "visible" : "hidden";
+  if (byId && inList) return "visible";
+  if (!byId && !inList) return "hidden";
+  return "mixed";
 }
 
-/** 현재 상태 요약: "visible" | "hidden" | "" (마지막 확인 결과 기준) */
+export const VERDICT_WORD = { visible: "보임", hidden: "안 보임", mixed: "엇갈림", gone: "영상/댓글창 없음" };
+
+/** '공개확인' 칸에 검사 기록을 덧붙인다. 같은 칸에 이력이 쌓인다: "보임 (10/23 02:40) → 안 보임 (10/24 09:10)" */
+export function appendVisibility(prev, verdict, nowMs = Date.now()) {
+  const when = kstStamp(new Date(nowMs)).slice(5, 16).replace("-", "/");   // "10/23 02:40"
+  const entry = `${VERDICT_WORD[verdict] || verdict} (${when})`;
+  const old = String(prev || "").trim();
+  return old ? `${old} → ${entry}` : entry;
+}
+
+/** 마지막 기록 기준 상태: "visible" | "hidden" | "mixed" | "gone" | "" (예전 '1차/2차' 형식도 읽음) */
 export function visibilityState(v) {
   if (!v) return "";
   const last = v.split("→").pop();
-  return last.includes("안 보임") ? "hidden" : "visible";
+  if (last.includes("엇갈림")) return "mixed";
+  if (last.includes("영상/댓글창 없음")) return "gone";
+  if (last.includes("안 보임")) return "hidden";
+  if (last.includes("보임")) return "visible";
+  return "";
+}
+
+/** 시트 제목 그대로, 없으면 ID 앞부분 */
+export function sheetLabel(ref) {
+  return (ref && ref.title) || (ref && ref.id ? ref.id.slice(0, 12) + "…" : "");
 }

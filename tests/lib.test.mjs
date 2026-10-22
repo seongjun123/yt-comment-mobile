@@ -111,23 +111,39 @@ test("errorReason", () => {
   assert.equal(L.errorReason(500, "oops").code, "other");
 });
 
-test("공개 확인 단계", () => {
+test("공개 검사", () => {
   const posted = "2026-10-23 01:00:00";            // KST
-  const t0 = L.parseKst(posted);
-  assert.equal(new Date(t0).toISOString(), "2026-10-22T16:00:00.000Z");
-  const it = (v, extra = {}) => ({ kind: "done", link: "https://www.youtube.com/watch?v=dpjYK2UuYAY&lc=UgxABC123", postedAt: posted, visibility: v, ...extra });
-  assert.equal(L.visibilityStage(it(""), t0 + 4 * 60e3), 0);          // 4분: 아직
-  assert.equal(L.visibilityStage(it(""), t0 + 5 * 60e3), 1);          // 5분: 1차
-  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05)"), t0 + 23 * 3600e3), 0);
-  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05)"), t0 + 24 * 3600e3), 2);
-  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05) → 2차 보임 (10/24 01:10)"), t0 + 48 * 3600e3), 0);
-  assert.equal(L.visibilityStage(it("", { kind: "target" }), t0 + 3600e3), 0);
-  assert.equal(L.visibilityStage(it("", { link: "" }), t0 + 3600e3), 0);
+  assert.equal(new Date(L.parseKst(posted)).toISOString(), "2026-10-22T16:00:00.000Z");
   assert.equal(L.commentIdFromLink("https://www.youtube.com/watch?v=x&lc=UgxABC123"), "UgxABC123");
-  const now = Date.parse("2026-10-23T01:05:00+09:00");
-  assert.equal(L.visibilityText("", 1, true, now), "1차 보임 (10/23 01:05)");
-  assert.equal(L.visibilityText("1차 보임 (10/23 01:05)", 2, false, now), "1차 보임 (10/23 01:05) → 2차 안 보임 (10/23 01:05)");
-  assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");
-  assert.equal(L.visibilityState("1차 안 보임 (x) → 2차 보임 (y)"), "visible");
+  assert.equal(L.commentIdFromLink(""), null);
+
+  const header = ["채널명", "제목", "영상 링크", "댓글", "상태", "게시시각", "댓글링크", "게시채널", "오류"];
+  const rows = [
+    ["A", "t1", "https://youtu.be/dpjYK2UuYAY", "c1", "게시 완료", posted, "https://www.youtube.com/watch?v=dpjYK2UuYAY&lc=Ugx1", "yun sj", ""],
+    ["B", "t2", "https://youtu.be/HuaGOfzVBiU", "c2", "실패", "", "", "", "꺼짐"],
+    ["C", "t3", "https://youtu.be/_njE1rfRTU0", "c3", "게시 완료", posted, "https://www.youtube.com/watch?v=_njE1rfRTU0&lc=Ugx3", "또이안이야", ""],
+  ];
+  const r = L.linkRows(header, rows);
+  assert.equal(r.linkCol, 6);
+  assert.equal(r.visCol, -1);                        // 공개확인 열 없음 → 검사 때 추가
+  assert.deepEqual(r.rows.map((x) => [x.row, x.cid, x.vid, x.text, x.postedBy]),
+    [[2, "Ugx1", "dpjYK2UuYAY", "c1", "yun sj"], [4, "Ugx3", "_njE1rfRTU0", "c3", "또이안이야"]]);
+  assert.equal(L.linkRows(["채널명", "영상 링크"], [["a", "https://youtu.be/dpjYK2UuYAY"]]), null);
+
+  assert.equal(L.visVerdict(true, true), "visible");
+  assert.equal(L.visVerdict(false, false), "hidden");
+  assert.equal(L.visVerdict(true, false), "mixed");
+  assert.equal(L.visVerdict(false, true), "mixed");
+  assert.equal(L.visVerdict(true, null), "visible");
+  assert.equal(L.visVerdict(false, null), "hidden");
+  assert.equal(L.visVerdict(false, null, true), "gone");
+
+  const now = Date.parse("2026-10-23T02:40:00+09:00");
+  assert.equal(L.appendVisibility("", "visible", now), "보임 (10/23 02:40)");
+  assert.equal(L.appendVisibility("보임 (10/23 02:40)", "hidden", now), "보임 (10/23 02:40) → 안 보임 (10/23 02:40)");
+  assert.equal(L.visibilityState("보임 (x) → 안 보임 (y)"), "hidden");
+  assert.equal(L.visibilityState("안 보임 (x) → 보임 (y)"), "visible");
+  assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");   // 예전 형식
+  assert.equal(L.visibilityState("엇갈림 (x)"), "mixed");
   assert.equal(L.visibilityState(""), "");
 });

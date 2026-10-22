@@ -1,8 +1,8 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js?v=1.2.0";
-import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.2.0";
+import * as L from "./lib.js?v=1.3.0";
+import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.3.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
@@ -44,6 +44,7 @@ const S = {
   currentSheet: store.get("currentSheet", null),
   delay: store.get("delay", { lo: 30, hi: 90 }),
   usage: store.get("usage", {}),             // { "YYYY-MM-DD"(태평양 기준): n }
+  mode: store.get("mode", "upload"),        // "upload" | "check"
   filter: "pending",
   sheet: null,     // 불러온 시트 { id, title, tab, tabId, colCount, header, cols, pos, items, counts }
   running: false,
@@ -353,9 +354,10 @@ async function findMyComment(vid, text) {
   return null;
 }
 
-// ------------------------------------------------------------------ 공개 확인
-// 로그인하지 않은 사람(시크릿 창) 기준으로 댓글이 보이는지 확인한다.
-// 로그인 토큰 없이 API 키로만 조회하면, 공개된 댓글만 돌아온다.
+// ------------------------------------------------------------------ 공개 검사 (업로드와 별개)
+// 시트에 남은 댓글링크를 '로그인 안 한 사람(시크릿 창)' 기준으로 지금 바로 검사한다.
+//  ① 댓글 ID로 직접 조회  ② 영상의 최신순 공개 댓글 목록에서 찾기 — 둘 다 로그인 없이 API 키로만.
+// 결과는 시트 '공개확인' 열에 이력으로 이어 쓴다.
 async function apiPublic(url) {
   let res;
   try { res = await fetch(url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(API_KEY)); }
@@ -365,41 +367,164 @@ async function apiPublic(url) {
   return text ? JSON.parse(text) : {};
 }
 
-async function checkVisibility({ manual = false } = {}) {
-  const sh = S.sheet;
-  if (!sh || sh.error || S.running || S.checkingVis || !sheetToken()) return;
-  const due = sh.items.map((it) => ({ it, stage: L.visibilityStage(it) })).filter((x) => x.stage);
-  if (!due.length) { if (manual) toast("지금 확인할 댓글이 없습니다 (게시 5분 후 1차, 24시간 후 2차)"); return; }
-  S.checkingVis = true;
+const C = {
+  sheets: store.get("checkSheets", []),   // [{ id, title, last: { at, total, visible, hidden, mixed, gone } }]
+  sel: store.get("checkSel", null),
+  deep: store.get("checkDeep", true),
+  result: null,                            // { id, items }
+  busy: false,
+  filter: "all",
+  prog: "",
+};
+const persistCheck = () => { store.set("checkSheets", C.sheets); store.set("checkSel", C.sel); store.set("checkDeep", C.deep); };
+
+const sheetMeta = (id) => withSheet(`${SHEETS}/${id}?fields=properties.title,sheets.properties(sheetId,title,index,gridProperties.columnCount)`);
+
+/** 시트 토큰이 없으면 자동 갱신(페이지 이동) 또는 로그인 안내. 진행 가능하면 true */
+function needSheetToken() {
+  if (sheetToken()) return true;
+  if (trySilent(staleKind())) return false;
+  showAuthBanner(channel() && valid(channel()) ? "sheet" : (channel() ? "channel" : "sheet"));
+  toast("시트를 읽을 구글 계정 로그인이 필요합니다");
+  return false;
+}
+
+function checkError(e) {
+  if (e instanceof ApiError && (e.status === 401 || e.status === 403) && e.sheet) {
+    showAuthBanner("sheet");
+    if (e.status === 403) toast("이 계정으로는 시트에 접근할 수 없습니다. 시트를 가진(공유받은) 계정으로 로그인하세요.", 6000);
+  } else if (e instanceof ApiError && e.status === 404 && e.sheet) toast("시트를 찾을 수 없습니다. 링크를 확인하세요.", 5000);
+  else toast(e.message, 6000);
+  log("공개 검사 오류", e.message);
+}
+
+async function addCheckSheet(input) {
+  const p = L.parseSheetUrl(input);
+  if (!p) { toast("구글 시트 링크가 아닙니다"); return false; }
+  if (!needSheetToken()) return false;
   try {
-    await ensureManagedColumns();
-    const visible = new Set();
-    for (let i = 0; i < due.length; i += 50) {
-      const ids = due.slice(i, i + 50).map((x) => L.commentIdFromLink(x.it.link));
-      const res = await apiPublic(`${YT}/commentThreads?part=id&id=${ids.join(",")}&maxResults=50`);
-      for (const t of res.items || []) visible.add(t.id);
+    const meta = await sheetMeta(p.id);
+    let ref = C.sheets.find((s) => s.id === p.id);
+    if (!ref) { ref = { id: p.id, title: "", last: null }; C.sheets.unshift(ref); }
+    ref.title = meta.properties.title;           // 시트 이름 그대로 (날짜가 들어 있음)
+    C.sel = ref.id; persistCheck(); renderCheck();
+    return true;
+  } catch (e) { checkError(e); return false; }
+}
+
+/** 영상의 최신순 공개 댓글 목록에서 찾기. 반환 { found:Set, reached:bool(우리 댓글 시점까지 다 봤는지), gone:bool } */
+async function scanVideo(vid, list) {
+  const want = new Set(list.map((x) => x.cid));
+  const times = list.map((x) => L.parseKst(x.postedAt)).filter(Number.isFinite);
+  const oldest = times.length ? Math.min(...times) - 60 * 60 * 1000 : null;   // 1시간 여유
+  const found = new Set();
+  let token = "";
+  for (let page = 0; page < 5; page++) {
+    let res;
+    try {
+      res = await apiPublic(`${YT}/commentThreads?part=snippet&videoId=${vid}&order=time&maxResults=100&textFormat=plainText${token ? "&pageToken=" + token : ""}`);
+    } catch (e) {
+      if (e instanceof ApiError && ["disabled", "notfound", "forbidden"].includes(e.code)) return { found, reached: false, gone: true };
+      throw e;
     }
-    let hidden = 0;
-    for (const { it, stage } of due) {
-      const ok = visible.has(L.commentIdFromLink(it.link));
-      if (!ok) hidden++;
-      const text = L.visibilityText(it.visibility, stage, ok);
-      await writeRow(it.row, { "공개확인": text });
-      it.visibility = text;
+    const items = res.items || [];
+    for (const t of items) if (want.has(t.id)) found.add(t.id);
+    if (found.size === want.size || !res.nextPageToken) return { found, reached: true, gone: false };
+    const last = items[items.length - 1];
+    const lastT = last ? Date.parse(last.snippet?.topLevelComment?.snippet?.publishedAt || "") : NaN;
+    if (oldest != null && Number.isFinite(lastT) && lastT < oldest) return { found, reached: true, gone: false };
+    token = res.nextPageToken;
+  }
+  return { found, reached: false, gone: false };   // 댓글이 너무 많아 거기까지 못 봄 → ①결과만 사용
+}
+
+async function writeVisibility(id, tabInfo, items) {
+  const grow = [], data = [];
+  for (const ti of tabInfo) {
+    const q = L.quoteSheet(ti.tab.title);
+    let col = ti.visCol;
+    if (col < 0) {
+      col = ti.width;
+      const cc = (ti.tab.gridProperties && ti.tab.gridProperties.columnCount) || 26;
+      if (col + 1 > cc) grow.push({ appendDimension: { sheetId: ti.tab.sheetId, dimension: "COLUMNS", length: col + 1 - cc } });
+      data.push({ range: `${q}!${L.colLetter(col)}1`, values: [["공개확인"]] });
     }
-    log("공개 확인", due.length, "건, 안 보임", hidden);
-    if (hidden) toast(`⚠ 댓글 ${hidden}개가 다른 사람에게 안 보입니다 ('숨김' 탭 확인)`, 6000);
-    else if (manual) toast(`${due.length}개 모두 공개 상태입니다`);
-  } catch (e) {
-    if (manual) toast(`공개 확인 실패: ${e.message}`, 5000);
-    log("공개 확인 실패", e.message);
-  } finally {
-    S.checkingVis = false;
-    render();
+    for (const it of items) {
+      if (it.tab !== ti.tab.title) continue;
+      it.visibility = L.appendVisibility(it.visibility, it.verdict);
+      data.push({ range: `${q}!${L.colLetter(col)}${it.row}`, values: [[it.visibility]] });
+    }
+  }
+  if (grow.length) await withSheet(`${SHEETS}/${id}:batchUpdate`, { method: "POST", body: { requests: grow } });
+  for (let i = 0; i < data.length; i += 500) {
+    await withSheet(`${SHEETS}/${id}/values:batchUpdate`, { method: "POST", body: { valueInputOption: "RAW", data: data.slice(i, i + 500) } });
   }
 }
 
-// ------------------------------------------------------------------ 게시 실행
+const setCheckProg = (t) => { C.prog = t; const el = $("checkProg"); if (el) el.textContent = t; };
+
+async function runCheck(id) {
+  if (C.busy) return;
+  const ref = C.sheets.find((s) => s.id === id);
+  if (!ref || !needSheetToken()) return;
+  C.busy = true; C.sel = id; C.result = null; C.filter = "all";
+  setCheckProg("시트 읽는 중…"); renderCheck();
+  try {
+    const meta = await sheetMeta(id);
+    ref.title = meta.properties.title;
+    const tabs = (meta.sheets || []).map((t) => t.properties).sort((a, b) => a.index - b.index);
+    const ranges = tabs.map((t) => "ranges=" + encodeURIComponent(`${L.quoteSheet(t.title)}!A1:ZZ`)).join("&");
+    const got = await withSheet(`${SHEETS}/${id}/values:batchGet?${ranges}&majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE`);
+    const items = [], tabInfo = [];
+    (got.valueRanges || []).forEach((vr, i) => {
+      const values = vr.values || [];
+      const lr = L.linkRows(values[0] || [], values.slice(1));
+      if (!lr || !lr.rows.length) return;
+      tabInfo.push({ tab: tabs[i], visCol: lr.visCol, width: Math.max(0, ...values.map((r) => r.length)) });
+      for (const r of lr.rows) items.push({ ...r, tab: tabs[i].title });
+    });
+    if (!items.length) throw new Error("이 시트에는 검사할 댓글링크가 없습니다. 업로드 기록(댓글링크 열)이 있는 시트를 넣어주세요.");
+
+    // ① 댓글 ID로 직접 조회 (50개당 할당량 1)
+    setCheckProg(`댓글 ${items.length}개 조회 중…`);
+    const byId = new Set();
+    const ids = [...new Set(items.map((x) => x.cid))];
+    for (let i = 0; i < ids.length; i += 50) {
+      const res = await apiPublic(`${YT}/commentThreads?part=id&id=${ids.slice(i, i + 50).join(",")}&maxResults=50`);
+      for (const t of res.items || []) byId.add(t.id);
+    }
+    // ② 영상별 최신순 목록 (영상당 할당량 1~5)
+    const byVid = new Map();
+    for (const it of items) { if (!byVid.has(it.vid)) byVid.set(it.vid, []); byVid.get(it.vid).push(it); }
+    let n = 0;
+    for (const [vid, list] of byVid) {
+      let r = { found: new Set(), reached: false, gone: false };
+      if (C.deep && vid) { n++; setCheckProg(`최신순 목록 확인 중… (영상 ${n}/${byVid.size})`); r = await scanVideo(vid, list); }
+      for (const it of list) {
+        it.byId = byId.has(it.cid);
+        it.inList = !C.deep || r.gone ? null : r.found.has(it.cid) ? true : r.reached ? false : null;
+        it.verdict = L.visVerdict(it.byId, it.inList, r.gone && !it.byId);
+      }
+    }
+    setCheckProg("시트에 기록 중…");
+    await writeVisibility(id, tabInfo, items);
+    const cnt = (v) => items.filter((x) => x.verdict === v).length;
+    ref.last = { at: L.kstStamp().slice(5, 16).replace("-", "/"), total: items.length, visible: cnt("visible"), hidden: cnt("hidden"), mixed: cnt("mixed"), gone: cnt("gone") };
+    C.result = { id, items };
+    C.filter = ref.last.hidden + ref.last.mixed + ref.last.gone ? "problem" : "all";
+    persistCheck();
+    setCheckProg(`검사 완료 · ${items.length}개 중 보임 ${ref.last.visible}개`);
+    log("공개 검사", ref.title, ref.last);
+    if (S.sheet && S.sheet.id === id) loadSheet().catch(() => {});   // 업로드 화면의 같은 시트도 새로
+  } catch (e) {
+    checkError(e);
+    setCheckProg(`검사 실패: ${e.message}`);
+  } finally {
+    C.busy = false;
+    renderCheck();
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const todayUsage = () => S.usage[L.quotaDayKey()] || 0;
 function addUsage() {
@@ -666,7 +791,6 @@ function renderSheets() {
   sel.disabled = !S.sheets.length || S.running;
   $("btnAddSheet").disabled = S.running;
   $("btnRefresh").disabled = !S.currentSheet || S.running;
-  $("btnVis").disabled = !S.sheet || !!S.sheet.error || S.running || S.checkingVis;
   const lnk = $("lnkSheet");
   if (S.currentSheet) { lnk.hidden = false; lnk.href = `https://docs.google.com/spreadsheets/d/${S.currentSheet}/edit`; }
   else lnk.hidden = true;
@@ -679,9 +803,7 @@ function renderSheets() {
   const c = sh.counts;
   const chip = (label, n) => (n ? `<span class="chip">${label} <b>${n}</b></span>` : "");
   sum.innerHTML = `<span class="chip">📄 ${esc(sh.tab)}</span>` + chip("대기", c.target + c.fail + c.orphan) + chip("완료", c.done)
-    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty)
-    + chip("👁 보임", sh.items.filter((i) => L.visibilityState(i.visibility) === "visible").length)
-    + chip("🚫 안 보임", sh.items.filter((i) => L.visibilityState(i.visibility) === "hidden").length);
+    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty);
   const reps = L.repeatedTexts(sh.items);
   if (reps.length) {
     w.textContent = `같은 댓글이 여러 영상에 반복됩니다 (“${reps[0].slice(0, 20)}”${reps.length > 1 ? ` 외 ${reps.length - 1}개` : ""}). 스팸으로 걸러질 가능성이 높습니다.`;
@@ -689,6 +811,7 @@ function renderSheets() {
   } else w.classList.add("hidden");
 }
 
+const VERDICT_ICON = { visible: "👁", hidden: "🚫", mixed: "⚠", gone: "✖" };
 const KIND_BADGE = {
   target: ["대기", ""], fail: ["재시도", "fail"], orphan: ["확인 필요", "fail"], done: ["✓ 완료", "ok"],
   skip: ["건너뜀", ""], dup: ["중복", ""], invalid: ["주소 오류", "fail"], empty: ["댓글 없음", ""],
@@ -703,10 +826,9 @@ function renderList() {
   let items = sh.items.filter((i) => i.kind !== "empty");
   if (S.filter === "pending") items = items.filter((i) => ["target", "fail", "orphan"].includes(i.kind) || i.row === S.postingRow);
   if (S.filter === "done") items = items.filter((i) => S.processed.includes(i.row) || i.row === S.postingRow);
-  if (S.filter === "hidden") items = items.filter((i) => L.visibilityState(i.visibility) === "hidden");
   empty.classList.toggle("hidden", items.length > 0);
   empty.textContent = S.filter === "pending" ? "게시할 행이 없습니다. 시트의 '댓글' 칸을 채우고 새로고침하세요."
-    : S.filter === "hidden" ? "안 보이는 댓글이 없습니다. (게시 5분 뒤 1차, 24시간 뒤 2차 자동 확인)" : "아직 없습니다.";
+    : "아직 없습니다.";
   list.innerHTML = items.slice(0, 300).map((it) => {
     const posting = it.row === S.postingRow;
     const [label, cls] = posting ? ["게시 중", "run"] : KIND_BADGE[it.kind] || [it.kind, ""];
@@ -714,8 +836,8 @@ function renderList() {
     const link = it.link ? ` · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a>` : "";
     const err = it.error && it.kind !== "done" ? ` · ${esc(it.error)}` : "";
     const vs = L.visibilityState(it.visibility);
-    const vis = it.kind === "done" ? (vs === "hidden" ? ` · <b class="hid">🚫 ${esc(it.visibility.split("→").pop().trim())}</b>`
-      : vs === "visible" ? ` · 👁 ${esc(it.visibility.split("→").pop().trim())}` : (it.link ? " · 공개 확인 대기" : "")) : "";
+    const lastVis = (it.visibility || "").split("→").pop().trim();
+    const vis = !vs ? "" : vs === "visible" ? ` · 👁 ${esc(lastVis)}` : ` · <b class="hid">${VERDICT_ICON[vs]} ${esc(lastVis)}</b>`;
     return `<li class="item ${posting ? "posting" : ""}">
       <div class="top"><div class="title">${esc(title)}</div><span class="badge ${cls}">${label}</span></div>
       <div class="meta">${it.row}행${it.channel ? " · " + esc(it.channel) : ""}${it.vid ? ` · <a href="${L.videoUrl(it.vid)}" target="_blank" rel="noopener">영상</a>` : ""}${link}${err}${vis}</div>
@@ -733,7 +855,64 @@ function renderRunbar() {
   $("btnStop").disabled = S.stopReq;
 }
 
-function render() { renderAccount(); renderSheets(); renderList(); renderRunbar(); }
+function renderMode() {
+  const check = S.mode === "check";
+  document.body.classList.toggle("mode-check", check);
+  $("uploadMode").classList.toggle("hidden", check);
+  $("checkMode").classList.toggle("hidden", !check);
+  document.querySelectorAll(".mode").forEach((b) => b.classList.toggle("active", b.dataset.mode === S.mode));
+}
+
+function renderCheck() {
+  if (!$("checkMode")) return;
+  $("chkDeep").checked = C.deep;
+  $("checkProg").textContent = C.prog;
+  const cards = $("checkSheets");
+  cards.innerHTML = C.sheets.map((s) => {
+    const l = s.last;
+    const sum = !l ? "아직 검사 안 함"
+      : `${esc(l.at)} 검사 · ${l.total}개 중 👁 ${l.visible}` + (l.hidden ? ` · 🚫 ${l.hidden}` : "") + (l.mixed ? ` · ⚠ ${l.mixed}` : "") + (l.gone ? ` · ✖ ${l.gone}` : "");
+    const sel = s.id === C.sel;
+    return `<li class="item sheet-card ${sel ? "selected" : ""}" data-id="${esc(s.id)}">
+      <div class="top"><div class="title">📄 ${esc(L.sheetLabel(s))}</div></div>
+      <div class="meta">${sum}</div>
+      <div class="row gap-s wrap">
+        <button class="primary small" data-act="run" ${C.busy || S.running ? "disabled" : ""}>${C.busy && sel ? "검사 중…" : "지금 검사"}</button>
+        <a class="btn ghost small" href="https://docs.google.com/spreadsheets/d/${esc(s.id)}/edit" target="_blank" rel="noopener">시트 열기</a>
+        <button class="ghost small danger" data-act="del" ${C.busy ? "disabled" : ""}>빼기</button>
+      </div>
+    </li>`;
+  }).join("");
+  $("checkEmpty").classList.toggle("hidden", C.sheets.length > 0);
+
+  const res = C.result && C.result.id === C.sel ? C.result : null;
+  $("checkResult").classList.toggle("hidden", !res);
+  if (!res) { $("checkList").innerHTML = ""; return; }
+  const cnt = (f) => res.items.filter(f).length;
+  const isProblem = (x) => x.verdict !== "visible";
+  document.querySelectorAll("#checkTabs .tab").forEach((t) => {
+    t.classList.toggle("active", t.dataset.cf === C.filter);
+    const n = t.dataset.cf === "all" ? res.items.length : t.dataset.cf === "problem" ? cnt(isProblem) : cnt((x) => x.verdict === "visible");
+    t.textContent = `${t.dataset.label} ${n}`;
+  });
+  let list = res.items;
+  if (C.filter === "problem") list = list.filter(isProblem);
+  if (C.filter === "visible") list = list.filter((x) => !isProblem(x));
+  const ox = (v) => (v == null ? "–" : v ? "O" : "X");
+  const BADGE = { visible: ["👁 보임", "ok"], hidden: ["🚫 안 보임", "fail"], mixed: ["⚠ 엇갈림", "fail"], gone: ["✖ 영상/댓글창 없음", "fail"] };
+  $("checkList").innerHTML = list.length ? list.slice(0, 500).map((it) => {
+    const [label, cls] = BADGE[it.verdict] || [it.verdict, ""];
+    return `<li class="item">
+      <div class="top"><div class="title">${esc(it.title || it.vid || "")}</div><span class="badge ${cls}">${label}</span></div>
+      <div class="meta">${esc(it.tab)} ${it.row}행${it.channel ? " · " + esc(it.channel) : ""}${it.postedBy ? " · 게시: " + esc(it.postedBy) : ""}${it.postedAt ? " · " + esc(it.postedAt.slice(5, 16).replace("-", "/")) : ""}</div>
+      <div class="meta">ID 조회 ${ox(it.byId)} · 최신순 목록 ${ox(it.inList)} · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a></div>
+      ${it.text ? `<div class="comment">${esc(it.text)}</div>` : ""}
+      <div class="meta">기록: ${esc(it.visibility)}</div>
+    </li>`;
+  }).join("") : `<li class="empty muted">해당하는 댓글이 없습니다.</li>`;
+}
+
+function render() { renderMode(); renderAccount(); renderSheets(); renderList(); renderRunbar(); renderCheck(); }
 
 // ------------------------------------------------------------------ 이벤트
 function bind() {
@@ -773,8 +952,36 @@ function bind() {
   };
   $("selSheet").onchange = (e) => { S.currentSheet = e.target.value; S.sheet = null; persist(); render(); safeLoad(); };
   $("btnRefresh").onclick = () => safeLoad();
-  $("btnVis").onclick = () => checkVisibility({ manual: true });
-  document.querySelectorAll(".tab").forEach((t) => t.onclick = () => { S.filter = t.dataset.filter; renderList(); });
+  document.querySelectorAll("#listSection .tab").forEach((t) => t.onclick = () => { S.filter = t.dataset.filter; renderList(); });
+
+  // 모드 전환: 댓글 업로드 / 공개 검사
+  document.querySelectorAll(".mode").forEach((b) => b.onclick = () => {
+    S.mode = b.dataset.mode; store.set("mode", S.mode); render();
+    if (S.mode === "upload" && S.currentSheet && sheetToken() && !S.running) safeLoad();
+  });
+  $("formCheckAdd").onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $("formCheckAdd").querySelector("button"); btn.disabled = true;
+    try { if (await addCheckSheet($("inpCheck").value)) $("inpCheck").value = ""; }
+    finally { btn.disabled = false; }
+  };
+  $("chkDeep").onchange = (e) => { C.deep = e.target.checked; persistCheck(); };
+  $("checkSheets").onclick = (e) => {
+    const b = e.target.closest("button[data-act]");
+    const card = e.target.closest(".sheet-card");
+    if (!card) return;
+    const id = card.dataset.id;
+    if (!b) { if (C.sel !== id) { C.sel = id; persistCheck(); renderCheck(); } return; }
+    if (b.dataset.act === "run") runCheck(id);
+    if (b.dataset.act === "del") {
+      const ref = C.sheets.find((s) => s.id === id);
+      if (!window.confirm(`'${L.sheetLabel(ref)}'를 검사 목록에서 뺄까요? (시트는 그대로)`)) return;
+      C.sheets = C.sheets.filter((s) => s.id !== id);
+      if (C.sel === id) { C.sel = C.sheets[0] ? C.sheets[0].id : null; C.result = null; }
+      persistCheck(); renderCheck();
+    }
+  };
+  document.querySelectorAll("#checkTabs .tab").forEach((t) => t.onclick = () => { C.filter = t.dataset.cf; renderCheck(); });
   $("btnStart").onclick = () => startRun().catch(handleRunError);
   $("btnStop").onclick = () => { S.stopReq = true; S.waitUntil = 0; setRunText("현재 행까지만 처리하고 멈춥니다…"); renderRunbar(); };
 
@@ -808,15 +1015,11 @@ function bind() {
     }
   });
   window.addEventListener("beforeunload", (e) => { if (S.running && !S.leaving) { e.preventDefault(); e.returnValue = ""; } });
-  setInterval(() => {
-    if (S.running) return;
-    renderAccount();
-    if (document.visibilityState === "visible") checkVisibility();   // 5분·24시간 지난 댓글 자동 확인
-  }, 60 * 1000);
+  setInterval(() => { if (!S.running) renderAccount(); }, 60 * 1000);
 }
 
 async function safeLoad() {
-  try { await loadSheet(); checkVisibility(); }
+  try { await loadSheet(); }
   catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       showAuthBanner(e.sheet && channel() && valid(channel()) ? "sheet" : "channel");

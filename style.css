@@ -177,3 +177,24 @@ hr { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
   font-size: 14px; max-width: 92vw; z-index: 20;
 }
 .item .hid { color: var(--fail); font-weight: 600; }
+
+/* 모드 전환 (업로드 / 공개 검사) */
+.modes {
+  position: sticky; top: calc(54px + env(safe-area-inset-top)); z-index: 4;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+  max-width: 720px; margin: 0 auto 12px; padding: 0 16px; background: var(--bg);
+}
+.mode { min-height: 44px; border-radius: 12px; font-weight: 600; }
+.mode.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+body.mode-check { padding-bottom: 24px; }
+body.mode-check .runbar { display: none; }
+body.mode-check .toast { bottom: 24px; }
+.check-opt { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; }
+.check-opt input { flex: none; min-height: 0; width: 18px; height: 18px; margin-top: 1px; }
+#checkSheets { margin-bottom: 8px; }
+.sheet-card { cursor: pointer; }
+.sheet-card.selected { border-color: var(--text); }
+.sheet-card .title { font-size: 15px; -webkit-line-clamp: 3; }
+.sheet-card .row { margin-top: 6px; }
+.check-prog { min-height: 20px; margin: 4px 2px 8px; }
+.legend { margin: 10px 2px 0; }

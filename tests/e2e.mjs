@@ -44,7 +44,9 @@ const videos = {
   DDDDDDDDDDD: { t: "D 영상", c: "D", on: true },
 };
 const posted = [];          // {by, vid, text, id}
-const hiddenIds = new Set(); // 남에게 안 보이는 댓글
+const hiddenIds = new Set(); // 남에게 안 보이는 댓글 (ID 조회에서 안 나옴)
+const listHidden = new Set(); // 최신순 목록에서만 안 나오는 댓글 (엇갈림 흉내)
+let listCalls = 0;
 let publicCalls = 0;
 
 function colIndex(letters) { let n = 0; for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; }
@@ -89,6 +91,14 @@ async function installMocks(page) {
       const ids = u.searchParams.get("id").split(",");
       return json(route, 200, { items: ids.filter((id) => posted.some((p) => p.id === id) && !hiddenIds.has(id)).map((id) => ({ id })) });
     }
+    if (!k && u.searchParams.get("key") && u.pathname.endsWith("/commentThreads") && u.searchParams.get("videoId")) {
+      listCalls++;
+      const vid = u.searchParams.get("videoId");
+      if (videos[vid] && !videos[vid].on) return json(route, 403, { error: { errors: [{ reason: "commentsDisabled" }], message: "disabled" } });
+      const items = posted.filter((x) => x.vid === vid && !hiddenIds.has(x.id) && !listHidden.has(x.id)).reverse()
+        .map((x) => ({ id: x.id, snippet: { topLevelComment: { snippet: { publishedAt: new Date().toISOString(), textOriginal: x.text } } } }));
+      return json(route, 200, { items });
+    }
     if (!k) return json(route, 401, { error: { message: "auth" } });
     if (k === "sheet") return json(route, 403, { error: { errors: [{ reason: "insufficientPermissions" }], message: "scope" } });
     const me = accounts[k].channel;
@@ -121,6 +131,7 @@ async function installMocks(page) {
       return json(route, 200, { properties: { title: "관제탑_롱폼" }, sheets: [{ properties: { sheetId: 0, title: "시트1", index: 0, gridProperties: { columnCount: colCount } } }] });
     }
     if (path.includes("/values/") && req.method() === "GET") return json(route, 200, { values: grid.map((r) => [...r]) });
+    if (path.endsWith("/values:batchGet")) return json(route, 200, { valueRanges: [{ values: grid.map((r) => [...r]) }] });
     if (path.endsWith(":batchUpdate") && path.includes("/values")) {
       try { for (const d of JSON.parse(req.postData()).data) setCell(d.range, d.values[0][0]); }
       catch (e) { return json(route, 400, { error: { message: e.message } }); }
@@ -312,32 +323,60 @@ await page.click("#btnRelogin");
 await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
 await page.waitForSelector(".item, #emptyMsg:not(.hidden)");
 
-// 9) 공개 확인: 5분 지난 댓글 1차, 24시간 지난 댓글 2차
-const kst = (msAgo) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(Date.now() - msAgo));
-const setByName = (row, name, v) => setCell(`x!${String.fromCharCode(65 + H().indexOf(name))}${row}`, v);
-check("방금 게시한 댓글은 아직 확인 안 함", cell(2, "공개확인") === "", cell(2, "공개확인"));
-setByName(2, "게시시각", kst(10 * 60e3));
-setByName(4, "게시시각", kst(10 * 60e3));
-hiddenIds.add(posted.find((p) => p.vid === "_njE1rfRTU0").id);   // 4행 댓글을 숨김 처리
-await page.click("#btnRefresh");                // 불러오면서 자동 확인
-await page.waitForFunction(() => document.querySelector("#summary")?.textContent.includes("안 보임"), null, { timeout: 10000 });
-check("1차: 보이는 댓글 = 보임", cell(2, "공개확인").startsWith("1차 보임"), cell(2, "공개확인"));
-check("1차: 숨겨진 댓글 = 안 보임", cell(4, "공개확인").startsWith("1차 안 보임"), cell(4, "공개확인"));
-await page.click('.tab[data-filter="hidden"]');
-const hiddenCards = await page.locator(".item").count();
-check("숨김 탭에 1건", hiddenCards === 1, String(hiddenCards));
-await page.screenshot({ path: `${OUT}/07-hidden-tab.png`, fullPage: true });
-const callsBefore = publicCalls;
-await page.click("#btnVis");
-await page.waitForTimeout(800);
-check("이미 1차 확인한 행은 다시 조회 안 함", publicCalls === callsBefore, String(publicCalls - callsBefore));
-setByName(2, "게시시각", kst(25 * 3600e3));
-hiddenIds.add(posted.find((p) => p.vid === "dpjYK2UuYAY").id);   // 하루 뒤 2행도 숨겨짐
-await page.click("#btnRefresh");
-await page.waitForFunction(() => true);
-await page.waitForTimeout(1500);
-check("2차: 하루 뒤 숨겨진 것 감지", cell(2, "공개확인").includes("→ 2차 안 보임"), cell(2, "공개확인"));
-check("공개 조회는 로그인 없이(키만)", publicCalls > 0);
+// 9) 공개 검사 (별도 모드): 시트 링크 넣고 지금 바로 검사
+check("업로드 화면에는 공개 확인 버튼 없음", (await page.locator("#btnVis").count()) === 0);
+check("업로드 화면에 숨김 탭 없음", (await page.locator('.tab[data-filter="hidden"]').count()) === 0);
+await page.click('.mode[data-mode="check"]');
+check("공개 검사 모드에선 게시 바 숨김", !(await page.isVisible(".runbar")));
+check("업로드 화면 숨김", !(await page.isVisible("#sheetCard")));
+await page.fill("#inpCheck", `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit#gid=0`);
+await page.click("#formCheckAdd button[type=submit]");
+await page.waitForSelector(".sheet-card");
+check("시트 이름 그대로 표시", (await page.textContent(".sheet-card .title")).includes("관제탑_롱폼"), await page.textContent(".sheet-card .title"));
+await page.fill("#inpCheck", "아무거나");
+await page.click("#formCheckAdd button[type=submit]");
+check("잘못된 링크 거부", (await page.locator(".sheet-card").count()) === 1);
+const doneRows = grid.slice(1).map((r, i) => i + 2).filter((row) => cell(row, "댓글링크").includes("lc="));
+const vidOf = (row) => cell(row, "댓글링크").match(/v=([\w-]{11})/)[1];
+const idOf = (row) => cell(row, "댓글링크").match(/lc=([\w.-]+)/)[1];
+check("검사 대상 행 3개 이상", doneRows.length >= 3, doneRows.join(","));
+const [rv, rh, rm] = doneRows;
+hiddenIds.clear(); listHidden.clear();
+hiddenIds.add(idOf(rh));          // 숨김 → 안 보임
+listHidden.add(idOf(rm));         // ID로는 나오는데 최신순 목록엔 없음 → 엇갈림
+const pc0 = publicCalls, lc0 = listCalls;
+await page.click('.sheet-card button[data-act="run"]');
+await page.waitForFunction(() => document.querySelector("#checkProg")?.textContent.startsWith("검사 완료"), null, { timeout: 15000 });
+await page.screenshot({ path: `${OUT}/07-check.png`, fullPage: true });
+check("보임 기록", cell(rv, "공개확인").startsWith("보임 ("), cell(rv, "공개확인"));
+check("안 보임 기록", cell(rh, "공개확인").startsWith("안 보임 ("), cell(rh, "공개확인"));
+check("엇갈림 기록", cell(rm, "공개확인").startsWith("엇갈림 ("), cell(rm, "공개확인"));
+check("ID 조회는 키로 1번(50개 묶음)", publicCalls - pc0 === 1, String(publicCalls - pc0));
+check("영상별 최신순 목록 조회", listCalls - lc0 === new Set(doneRows.map(vidOf)).size, String(listCalls - lc0));
+check("문제 탭 기본 선택", (await page.getAttribute('#checkTabs .tab.active', "data-cf")) === "problem");
+const probCards = await page.locator("#checkList .item").count();
+check("문제 탭에 안 보임+엇갈림", probCards === 2, String(probCards));
+check("카드 요약 표시", (await page.textContent(".sheet-card .meta")).includes(`${doneRows.length}개 중`), await page.textContent(".sheet-card .meta"));
+// 다시 검사하면 이력이 이어진다
+hiddenIds.clear(); listHidden.clear();
+await page.click('.sheet-card button[data-act="run"]');
+await page.waitForFunction(() => document.querySelector("#checkProg")?.textContent.startsWith("검사 완료"), null, { timeout: 15000 });
+check("이력 이어 쓰기", /^안 보임 \(.+\) → 보임 \(/.test(cell(rh, "공개확인")), cell(rh, "공개확인"));
+check("모두 보이면 전체 탭", (await page.getAttribute('#checkTabs .tab.active', "data-cf")) === "all");
+// 정밀 검사 끄면 목록 조회 안 함
+await page.uncheck("#chkDeep");
+const lc1 = listCalls;
+await page.click('.sheet-card button[data-act="run"]');
+await page.waitForFunction(() => document.querySelector("#checkProg")?.textContent.startsWith("검사 완료"), null, { timeout: 15000 });
+check("최신순 끄면 ID 조회만", listCalls === lc1, String(listCalls - lc1));
+await page.check("#chkDeep");
+// 새로고침해도 모드·시트 목록 유지
+await page.reload();
+await page.waitForSelector(".sheet-card");
+check("새로고침 후 공개 검사 모드 유지", await page.isVisible("#checkMode"));
+await page.click('.mode[data-mode="upload"]');
+await page.waitForSelector("#sheetCard");
+check("업로드로 돌아오면 게시 바 보임", await page.isVisible(".runbar"));
 
 // 10) 다크 모드 스크린샷
 await page.emulateMedia({ colorScheme: "dark" });
