@@ -8,7 +8,7 @@ export const STATUS = {
 };
 
 // 앱이 관리하는 열 (없으면 시트 맨 오른쪽에 추가)
-export const MANAGED_COLUMNS = ["상태", "게시시각", "댓글링크", "게시채널", "오류"];
+export const MANAGED_COLUMNS = ["상태", "게시시각", "댓글링크", "게시채널", "오류", "공개확인"];
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
@@ -134,6 +134,7 @@ export function classifyRows(rows, cols, pos) {
       title: get(r, cols.title), channel: get(r, cols.channel),
       postedAt: get(r, pos["게시시각"]), link: get(r, pos["댓글링크"]),
       postedBy: get(r, pos["게시채널"]), error: get(r, pos["오류"]),
+      visibility: get(r, pos["공개확인"]),
     };
     let kind;
     if (!text) kind = url || status ? "empty" : null;
@@ -201,4 +202,48 @@ export function errorReason(status, body) {
   if (/insufficientPermissions|ACCESS_TOKEN_SCOPE_INSUFFICIENT/.test(all)) return { code: "scope", message: "권한이 부족합니다 (다시 로그인 필요)" };
   if (status === 403) return { code: "forbidden", message: msg ? `권한 없음: ${msg}` : "권한이 없습니다" };
   return { code: "other", message: (msg || `오류 ${status}`).slice(0, 150) };
+}
+
+// ------------------------------------------------------------------ 공개 확인 (로그인 없이 댓글이 보이는지)
+
+export const VIS_FIRST_MIN = 5;          // 게시 후 1차 확인까지 (분)
+export const VIS_SECOND_HOURS = 24;      // 게시 후 2차 확인까지 (시간)
+
+/** 댓글링크(…&lc=ID)에서 댓글 스레드 ID */
+export function commentIdFromLink(link) {
+  const m = String(link || "").match(/[?&]lc=([A-Za-z0-9_.-]+)/);
+  return m ? m[1] : null;
+}
+
+/** "2026-10-23 00:41:05"(한국 시간) → ms. 형식이 다르면 NaN */
+export function parseKst(stamp) {
+  const m = String(stamp || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return NaN;
+  return Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || "00"}+09:00`);
+}
+
+/** 이 행에 지금 필요한 확인 단계: 1 | 2 | 0(필요 없음) */
+export function visibilityStage(item, nowMs = Date.now(), firstMin = VIS_FIRST_MIN, secondHours = VIS_SECOND_HOURS) {
+  if (item.kind !== "done" || !commentIdFromLink(item.link)) return 0;
+  const t = parseKst(item.postedAt);
+  if (!Number.isFinite(t)) return 0;
+  const age = nowMs - t;
+  const v = item.visibility || "";
+  if (!v) return age >= firstMin * 60 * 1000 ? 1 : 0;
+  if (v.startsWith("1차") && !v.includes("2차") && age >= secondHours * 3600 * 1000) return 2;
+  return 0;
+}
+
+/** 확인 결과를 '공개확인' 칸 문구로 */
+export function visibilityText(prev, stage, visible, nowMs = Date.now()) {
+  const when = kstStamp(new Date(nowMs)).slice(5, 16).replace("-", "/");   // "10/23 00:41"
+  const word = visible ? "보임" : "안 보임";
+  return stage === 1 ? `1차 ${word} (${when})` : `${prev} → 2차 ${word} (${when})`;
+}
+
+/** 현재 상태 요약: "visible" | "hidden" | "" (마지막 확인 결과 기준) */
+export function visibilityState(v) {
+  if (!v) return "";
+  const last = v.split("→").pop();
+  return last.includes("안 보임") ? "hidden" : "visible";
 }

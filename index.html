@@ -9,11 +9,11 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="댓글 도우미">
-  <meta name="referrer" content="no-referrer">
+  <meta name="referrer" content="strict-origin">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="style.css?v=1.0.0">
+  <link rel="stylesheet" href="style.css?v=1.1.0">
 </head>
 <body>
   <header class="topbar">
@@ -45,6 +45,7 @@
       <div class="row between">
         <h2>구글 시트</h2>
         <div class="row gap-s">
+          <button class="ghost small" id="btnVis" disabled title="로그인 안 한 사람에게 댓글이 보이는지 확인">공개 확인</button>
           <button class="ghost small" id="btnRefresh" disabled>새로고침</button>
           <a class="ghost small btn" id="lnkSheet" target="_blank" rel="noopener" hidden>열기</a>
         </div>
@@ -73,6 +74,7 @@
       <div class="tabs" role="tablist">
         <button role="tab" class="tab active" data-filter="pending">대기</button>
         <button role="tab" class="tab" data-filter="done">이번에 처리</button>
+        <button role="tab" class="tab" data-filter="hidden">숨김</button>
         <button role="tab" class="tab" data-filter="all">전체</button>
       </div>
       <ul class="list" id="list"></ul>
@@ -125,6 +127,6 @@
   </dialog>
 
   <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="app.js?v=1.0.0"></script>
+  <script type="module" src="app.js?v=1.1.0"></script>
 </body>
 </html>

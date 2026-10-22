@@ -41,7 +41,7 @@ test("findColumns: 관제탑 형식", () => {
   assert.equal(c.channel, 0);
   assert.equal(c.managed["상태"], -1);
   const plan = L.planManagedColumns(HEADER, c);
-  assert.deepEqual(plan.add.map((a) => [a.name, a.index]), [["상태", 7], ["게시시각", 8], ["댓글링크", 9], ["게시채널", 10], ["오류", 11]]);
+  assert.deepEqual(plan.add.map((a) => [a.name, a.index]), [["상태", 7], ["게시시각", 8], ["댓글링크", 9], ["게시채널", 10], ["오류", 11], ["공개확인", 12]]);
 });
 
 test("findColumns: '댓글 수' 열은 댓글 열이 아니다", () => {
@@ -54,7 +54,7 @@ test("findColumns: 이미 관리 열이 있으면 그 위치 사용", () => {
   const h = [...HEADER, "상태", "게시시각", "댓글링크", "게시채널", "오류"];
   const c = L.findColumns(h, [row("a", "t", "dpjYK2UuYAY", "c", "게시 완료")]);
   assert.equal(c.managed["상태"], 7);
-  assert.equal(L.planManagedColumns(h, c).add.length, 0);
+  assert.deepEqual(L.planManagedColumns(h, c).add.map((a) => a.name), ["공개확인"]);   // 1.1.0에서 추가된 열만
 });
 
 test("classifyRows", () => {
@@ -109,4 +109,25 @@ test("errorReason", () => {
   assert.equal(L.errorReason(404, b("videoNotFound")).code, "notfound");
   assert.equal(L.errorReason(403, b("forbidden")).code, "forbidden");
   assert.equal(L.errorReason(500, "oops").code, "other");
+});
+
+test("공개 확인 단계", () => {
+  const posted = "2026-10-23 01:00:00";            // KST
+  const t0 = L.parseKst(posted);
+  assert.equal(new Date(t0).toISOString(), "2026-10-22T16:00:00.000Z");
+  const it = (v, extra = {}) => ({ kind: "done", link: "https://www.youtube.com/watch?v=dpjYK2UuYAY&lc=UgxABC123", postedAt: posted, visibility: v, ...extra });
+  assert.equal(L.visibilityStage(it(""), t0 + 4 * 60e3), 0);          // 4분: 아직
+  assert.equal(L.visibilityStage(it(""), t0 + 5 * 60e3), 1);          // 5분: 1차
+  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05)"), t0 + 23 * 3600e3), 0);
+  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05)"), t0 + 24 * 3600e3), 2);
+  assert.equal(L.visibilityStage(it("1차 보임 (10/23 01:05) → 2차 보임 (10/24 01:10)"), t0 + 48 * 3600e3), 0);
+  assert.equal(L.visibilityStage(it("", { kind: "target" }), t0 + 3600e3), 0);
+  assert.equal(L.visibilityStage(it("", { link: "" }), t0 + 3600e3), 0);
+  assert.equal(L.commentIdFromLink("https://www.youtube.com/watch?v=x&lc=UgxABC123"), "UgxABC123");
+  const now = Date.parse("2026-10-23T01:05:00+09:00");
+  assert.equal(L.visibilityText("", 1, true, now), "1차 보임 (10/23 01:05)");
+  assert.equal(L.visibilityText("1차 보임 (10/23 01:05)", 2, false, now), "1차 보임 (10/23 01:05) → 2차 안 보임 (10/23 01:05)");
+  assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");
+  assert.equal(L.visibilityState("1차 안 보임 (x) → 2차 보임 (y)"), "visible");
+  assert.equal(L.visibilityState(""), "");
 });

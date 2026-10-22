@@ -1,8 +1,8 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js";
-import { CLIENT_ID, APP_VERSION } from "./config.js";
+import * as L from "./lib.js?v=1.1.0";
+import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.1.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
@@ -307,6 +307,7 @@ async function writeRow(row, fields) {
         if ("게시시각" in fields) it.postedAt = fields["게시시각"];
         if ("오류" in fields) it.error = fields["오류"];
         if ("게시채널" in fields) it.postedBy = fields["게시채널"];
+        if ("공개확인" in fields) it.visibility = fields["공개확인"];
       }
       return;
     } catch (e) {
@@ -346,6 +347,52 @@ async function findMyComment(vid, text) {
     if (sn.authorChannelId && sn.authorChannelId.value === S.current && (sn.textOriginal || "").trim() === text.trim()) return t.id;
   }
   return null;
+}
+
+// ------------------------------------------------------------------ 공개 확인
+// 로그인하지 않은 사람(시크릿 창) 기준으로 댓글이 보이는지 확인한다.
+// 로그인 토큰 없이 API 키로만 조회하면, 공개된 댓글만 돌아온다.
+async function apiPublic(url) {
+  let res;
+  try { res = await fetch(url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(API_KEY)); }
+  catch { const e = new Error("네트워크 연결을 확인해주세요"); e.network = true; throw e; }
+  const text = await res.text();
+  if (!res.ok) { log("공개 조회 오류", res.status, text.slice(0, 200)); throw new ApiError(res.status, text); }
+  return text ? JSON.parse(text) : {};
+}
+
+async function checkVisibility({ manual = false } = {}) {
+  const sh = S.sheet;
+  if (!sh || sh.error || S.running || S.checkingVis || !sheetToken()) return;
+  const due = sh.items.map((it) => ({ it, stage: L.visibilityStage(it) })).filter((x) => x.stage);
+  if (!due.length) { if (manual) toast("지금 확인할 댓글이 없습니다 (게시 5분 후 1차, 24시간 후 2차)"); return; }
+  S.checkingVis = true;
+  try {
+    await ensureManagedColumns();
+    const visible = new Set();
+    for (let i = 0; i < due.length; i += 50) {
+      const ids = due.slice(i, i + 50).map((x) => L.commentIdFromLink(x.it.link));
+      const res = await apiPublic(`${YT}/commentThreads?part=id&id=${ids.join(",")}&maxResults=50`);
+      for (const t of res.items || []) visible.add(t.id);
+    }
+    let hidden = 0;
+    for (const { it, stage } of due) {
+      const ok = visible.has(L.commentIdFromLink(it.link));
+      if (!ok) hidden++;
+      const text = L.visibilityText(it.visibility, stage, ok);
+      await writeRow(it.row, { "공개확인": text });
+      it.visibility = text;
+    }
+    log("공개 확인", due.length, "건, 안 보임", hidden);
+    if (hidden) toast(`⚠ 댓글 ${hidden}개가 다른 사람에게 안 보입니다 ('숨김' 탭 확인)`, 6000);
+    else if (manual) toast(`${due.length}개 모두 공개 상태입니다`);
+  } catch (e) {
+    if (manual) toast(`공개 확인 실패: ${e.message}`, 5000);
+    log("공개 확인 실패", e.message);
+  } finally {
+    S.checkingVis = false;
+    render();
+  }
 }
 
 // ------------------------------------------------------------------ 게시 실행
@@ -578,6 +625,7 @@ function renderSheets() {
   sel.disabled = !S.sheets.length || S.running;
   $("btnAddSheet").disabled = S.running;
   $("btnRefresh").disabled = !S.currentSheet || S.running;
+  $("btnVis").disabled = !S.sheet || !!S.sheet.error || S.running || S.checkingVis;
   const lnk = $("lnkSheet");
   if (S.currentSheet) { lnk.hidden = false; lnk.href = `https://docs.google.com/spreadsheets/d/${S.currentSheet}/edit`; }
   else lnk.hidden = true;
@@ -590,7 +638,9 @@ function renderSheets() {
   const c = sh.counts;
   const chip = (label, n) => (n ? `<span class="chip">${label} <b>${n}</b></span>` : "");
   sum.innerHTML = `<span class="chip">📄 ${esc(sh.tab)}</span>` + chip("대기", c.target + c.fail + c.orphan) + chip("완료", c.done)
-    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty);
+    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty)
+    + chip("👁 보임", sh.items.filter((i) => L.visibilityState(i.visibility) === "visible").length)
+    + chip("🚫 안 보임", sh.items.filter((i) => L.visibilityState(i.visibility) === "hidden").length);
   const reps = L.repeatedTexts(sh.items);
   if (reps.length) {
     w.textContent = `같은 댓글이 여러 영상에 반복됩니다 (“${reps[0].slice(0, 20)}”${reps.length > 1 ? ` 외 ${reps.length - 1}개` : ""}). 스팸으로 걸러질 가능성이 높습니다.`;
@@ -612,17 +662,22 @@ function renderList() {
   let items = sh.items.filter((i) => i.kind !== "empty");
   if (S.filter === "pending") items = items.filter((i) => ["target", "fail", "orphan"].includes(i.kind) || i.row === S.postingRow);
   if (S.filter === "done") items = items.filter((i) => S.processed.includes(i.row) || i.row === S.postingRow);
+  if (S.filter === "hidden") items = items.filter((i) => L.visibilityState(i.visibility) === "hidden");
   empty.classList.toggle("hidden", items.length > 0);
-  empty.textContent = S.filter === "pending" ? "게시할 행이 없습니다. 시트의 '댓글' 칸을 채우고 새로고침하세요." : "아직 없습니다.";
+  empty.textContent = S.filter === "pending" ? "게시할 행이 없습니다. 시트의 '댓글' 칸을 채우고 새로고침하세요."
+    : S.filter === "hidden" ? "안 보이는 댓글이 없습니다. (게시 5분 뒤 1차, 24시간 뒤 2차 자동 확인)" : "아직 없습니다.";
   list.innerHTML = items.slice(0, 300).map((it) => {
     const posting = it.row === S.postingRow;
     const [label, cls] = posting ? ["게시 중", "run"] : KIND_BADGE[it.kind] || [it.kind, ""];
     const title = it.title || it.url;
     const link = it.link ? ` · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a>` : "";
     const err = it.error && it.kind !== "done" ? ` · ${esc(it.error)}` : "";
+    const vs = L.visibilityState(it.visibility);
+    const vis = it.kind === "done" ? (vs === "hidden" ? ` · <b class="hid">🚫 ${esc(it.visibility.split("→").pop().trim())}</b>`
+      : vs === "visible" ? ` · 👁 ${esc(it.visibility.split("→").pop().trim())}` : (it.link ? " · 공개 확인 대기" : "")) : "";
     return `<li class="item ${posting ? "posting" : ""}">
       <div class="top"><div class="title">${esc(title)}</div><span class="badge ${cls}">${label}</span></div>
-      <div class="meta">${it.row}행${it.channel ? " · " + esc(it.channel) : ""}${it.vid ? ` · <a href="${L.videoUrl(it.vid)}" target="_blank" rel="noopener">영상</a>` : ""}${link}${err}</div>
+      <div class="meta">${it.row}행${it.channel ? " · " + esc(it.channel) : ""}${it.vid ? ` · <a href="${L.videoUrl(it.vid)}" target="_blank" rel="noopener">영상</a>` : ""}${link}${err}${vis}</div>
       <div class="comment">${esc(it.text)}</div>
     </li>`;
   }).join("");
@@ -677,6 +732,7 @@ function bind() {
   };
   $("selSheet").onchange = (e) => { S.currentSheet = e.target.value; S.sheet = null; persist(); render(); safeLoad(); };
   $("btnRefresh").onclick = () => safeLoad();
+  $("btnVis").onclick = () => checkVisibility({ manual: true });
   document.querySelectorAll(".tab").forEach((t) => t.onclick = () => { S.filter = t.dataset.filter; renderList(); });
   $("btnStart").onclick = () => startRun().catch(handleRunError);
   $("btnStop").onclick = () => { S.stopReq = true; S.waitUntil = 0; setRunText("현재 행까지만 처리하고 멈춥니다…"); renderRunbar(); };
@@ -710,11 +766,15 @@ function bind() {
     }
   });
   window.addEventListener("beforeunload", (e) => { if (S.running && !S.leaving) { e.preventDefault(); e.returnValue = ""; } });
-  setInterval(() => { if (!S.running) renderAccount(); }, 60 * 1000);
+  setInterval(() => {
+    if (S.running) return;
+    renderAccount();
+    if (document.visibilityState === "visible") checkVisibility();   // 5분·24시간 지난 댓글 자동 확인
+  }, 60 * 1000);
 }
 
 async function safeLoad() {
-  try { await loadSheet(); }
+  try { await loadSheet(); checkVisibility(); }
   catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       showAuthBanner(e.sheet && channel() && valid(channel()) ? "sheet" : "channel");

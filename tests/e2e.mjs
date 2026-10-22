@@ -41,6 +41,8 @@ const videos = {
   DDDDDDDDDDD: { t: "D 영상", c: "D", on: true },
 };
 const posted = [];          // {by, vid, text, id}
+const hiddenIds = new Set(); // 남에게 안 보이는 댓글
+let publicCalls = 0;
 
 function colIndex(letters) { let n = 0; for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; }
 function setCell(a1, v) {
@@ -77,6 +79,11 @@ async function installMocks(page) {
   });
   await page.route("https://www.googleapis.com/youtube/v3/**", (route) => {
     const req = route.request(), u = new URL(req.url()), k = who(req);
+    if (!k && u.searchParams.get("key") && u.pathname.endsWith("/commentThreads") && u.searchParams.get("id")) {
+      publicCalls++;
+      const ids = u.searchParams.get("id").split(",");
+      return json(route, 200, { items: ids.filter((id) => posted.some((p) => p.id === id) && !hiddenIds.has(id)).map((id) => ({ id })) });
+    }
     if (!k) return json(route, 401, { error: { message: "auth" } });
     if (k === "sheet") return json(route, 403, { error: { errors: [{ reason: "insufficientPermissions" }], message: "scope" } });
     const me = accounts[k].channel;
@@ -172,7 +179,7 @@ await page.waitForFunction(() => document.querySelector("#dlgTitle").textContent
 await page.screenshot({ path: `${OUT}/04-result.png` });
 await page.click("#dlgOk");
 check("2건 게시", posted.length === 2, JSON.stringify(posted));
-check("관리 열 추가", H().slice(7).join(",") === "상태,게시시각,댓글링크,게시채널,오류", H().join(","));
+check("관리 열 추가", H().slice(7).join(",") === "상태,게시시각,댓글링크,게시채널,오류,공개확인", H().join(","));
 check("2행 게시 완료", cell(2, "상태") === "게시 완료" && cell(2, "댓글링크").includes("&lc=cmt"), cell(2, "상태"));
 check("2행 게시채널", cell(2, "게시채널") === "yun sj");
 check("3행(댓글 없음) 그대로", cell(3, "상태") === "");
@@ -257,10 +264,37 @@ await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textConten
 check("수동 로그인 후 이어서 게시", posted.length === n1 + 1 && posted.at(-1).text === "수동 갱신 테스트", String(posted.length - n1));
 await page.click("#dlgOk");
 
-// 9) 다크 모드 스크린샷
+// 9) 공개 확인: 5분 지난 댓글 1차, 24시간 지난 댓글 2차
+const kst = (msAgo) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(Date.now() - msAgo));
+const setByName = (row, name, v) => setCell(`x!${String.fromCharCode(65 + H().indexOf(name))}${row}`, v);
+check("방금 게시한 댓글은 아직 확인 안 함", cell(2, "공개확인") === "", cell(2, "공개확인"));
+setByName(2, "게시시각", kst(10 * 60e3));
+setByName(4, "게시시각", kst(10 * 60e3));
+hiddenIds.add(posted.find((p) => p.vid === "_njE1rfRTU0").id);   // 4행 댓글을 숨김 처리
+await page.click("#btnRefresh");                // 불러오면서 자동 확인
+await page.waitForFunction(() => document.querySelector("#summary")?.textContent.includes("안 보임"), null, { timeout: 10000 });
+check("1차: 보이는 댓글 = 보임", cell(2, "공개확인").startsWith("1차 보임"), cell(2, "공개확인"));
+check("1차: 숨겨진 댓글 = 안 보임", cell(4, "공개확인").startsWith("1차 안 보임"), cell(4, "공개확인"));
+await page.click('.tab[data-filter="hidden"]');
+const hiddenCards = await page.locator(".item").count();
+check("숨김 탭에 1건", hiddenCards === 1, String(hiddenCards));
+await page.screenshot({ path: `${OUT}/07-hidden-tab.png`, fullPage: true });
+const callsBefore = publicCalls;
+await page.click("#btnVis");
+await page.waitForTimeout(800);
+check("이미 1차 확인한 행은 다시 조회 안 함", publicCalls === callsBefore, String(publicCalls - callsBefore));
+setByName(2, "게시시각", kst(25 * 3600e3));
+hiddenIds.add(posted.find((p) => p.vid === "dpjYK2UuYAY").id);   // 하루 뒤 2행도 숨겨짐
+await page.click("#btnRefresh");
+await page.waitForFunction(() => true);
+await page.waitForTimeout(1500);
+check("2차: 하루 뒤 숨겨진 것 감지", cell(2, "공개확인").includes("→ 2차 안 보임"), cell(2, "공개확인"));
+check("공개 조회는 로그인 없이(키만)", publicCalls > 0);
+
+// 10) 다크 모드 스크린샷
 await page.emulateMedia({ colorScheme: "dark" });
 await page.waitForTimeout(300);
-await page.screenshot({ path: `${OUT}/07-dark.png` });
+await page.screenshot({ path: `${OUT}/08-dark.png` });
 
 check("페이지 오류 없음", errors.length === 0, errors.join(" | "));
 await browser.close();
