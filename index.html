@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>댓글 도우미</title>
+  <meta name="description" content="구글 시트의 댓글을 유튜브에 게시하는 개인용 도구">
+  <meta name="theme-color" content="#C4302B">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="댓글 도우미">
+  <meta name="referrer" content="no-referrer">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css?v=1.0.0">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="icons/icon-192.png" alt="" width="24" height="24"> 댓글 도우미</div>
+    <button class="ghost small" id="btnSettings" aria-label="설정">설정</button>
+  </header>
+
+  <main id="app">
+    <!-- 계정 -->
+    <section class="card" id="accountCard">
+      <div class="acct">
+        <img class="avatar" id="acctAvatar" alt="" width="48" height="48">
+        <div class="acct-text">
+          <div class="muted tiny">게시 채널</div>
+          <div class="acct-title" id="acctTitle">로그인이 필요합니다</div>
+          <div class="muted small" id="acctSub"></div>
+        </div>
+      </div>
+      <div class="row gap">
+        <select id="selChannel" aria-label="게시 채널 선택"></select>
+        <button id="btnLogin" class="primary">구글 로그인</button>
+      </div>
+      <div class="sheet-auth small" id="sheetAuth"></div>
+      <div class="banner warn hidden" id="authBanner"></div>
+    </section>
+
+    <!-- 시트 -->
+    <section class="card" id="sheetCard">
+      <div class="row between">
+        <h2>구글 시트</h2>
+        <div class="row gap-s">
+          <button class="ghost small" id="btnRefresh" disabled>새로고침</button>
+          <a class="ghost small btn" id="lnkSheet" target="_blank" rel="noopener" hidden>열기</a>
+        </div>
+      </div>
+      <div class="row gap">
+        <select id="selSheet" aria-label="시트 선택"></select>
+        <button id="btnAddSheet">＋ 추가</button>
+      </div>
+      <form class="add-sheet hidden" id="formAddSheet">
+        <input id="inpSheet" type="url" inputmode="url" autocomplete="off"
+               placeholder="시트 링크 붙여넣기 (https://docs.google.com/spreadsheets/…)">
+        <div class="row gap">
+          <button type="submit" class="primary">시트 등록</button>
+          <button type="button" class="ghost" id="btnCancelSheet">취소</button>
+          <button type="button" class="ghost danger" id="btnRemoveSheet">이 시트 빼기</button>
+        </div>
+        <p class="muted tiny">시트 1행은 머리글이어야 하고, '댓글' 열과 유튜브 주소 열이 필요합니다.
+          관제탑 CSV를 구글 시트로 가져온 뒤 맨 오른쪽에 '댓글' 열을 추가하면 됩니다.</p>
+      </form>
+      <div class="summary" id="summary"></div>
+      <div class="banner warn hidden" id="sheetWarn"></div>
+    </section>
+
+    <!-- 목록 -->
+    <section id="listSection">
+      <div class="tabs" role="tablist">
+        <button role="tab" class="tab active" data-filter="pending">대기</button>
+        <button role="tab" class="tab" data-filter="done">이번에 처리</button>
+        <button role="tab" class="tab" data-filter="all">전체</button>
+      </div>
+      <ul class="list" id="list"></ul>
+      <p class="empty muted" id="emptyMsg">시트를 등록하면 댓글이 있는 행이 여기에 표시됩니다.</p>
+    </section>
+  </main>
+
+  <!-- 하단 실행 바 -->
+  <footer class="runbar">
+    <div class="run-info">
+      <div class="progress"><div class="bar" id="progBar"></div></div>
+      <div class="small" id="runText">대기 중</div>
+    </div>
+    <button class="primary big" id="btnStart" disabled>▶ 게시 시작</button>
+    <button class="danger big hidden" id="btnStop">■ 중지</button>
+  </footer>
+
+  <!-- 확인 창 -->
+  <dialog id="dlgConfirm">
+    <form method="dialog">
+      <h3 id="dlgTitle">게시할까요?</h3>
+      <div id="dlgBody" class="dlg-body"></div>
+      <div class="row gap end">
+        <button value="cancel" class="ghost">취소</button>
+        <button value="ok" class="primary" id="dlgOk">게시 시작</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 설정 -->
+  <dialog id="dlgSettings">
+    <form method="dialog">
+      <h3>설정</h3>
+      <label class="field">댓글 사이 간격 (초, 무작위)
+        <span class="row gap-s">
+          <input id="inpLo" type="number" min="0" max="3600" inputmode="numeric"> ~
+          <input id="inpHi" type="number" min="0" max="3600" inputmode="numeric">
+        </span>
+      </label>
+      <div class="muted small" id="usageText"></div>
+      <hr>
+      <div class="row gap wrap">
+        <button type="button" class="ghost" id="btnCopyLog">문제 신고용 기록 복사</button>
+        <button type="button" class="ghost danger" id="btnLogoutAll">모든 로그인 지우기</button>
+      </div>
+      <p class="muted tiny" id="verText"></p>
+      <p class="muted tiny"><a href="privacy.html" target="_blank" rel="noopener">개인정보처리방침</a></p>
+      <div class="row end"><button value="close" class="primary" id="btnSettingsSave">저장</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="app.js?v=1.0.0"></script>
+</body>
+</html>
