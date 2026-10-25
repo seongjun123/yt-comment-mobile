@@ -5,4 +5,6 @@ export const CLIENT_ID = "790103549362-434ces0uh83o75bu7ntrndqt2ic08nqf.apps.goo
 // 로그인 없이 "남에게 보이는지" 확인하는 데만 쓰는 API 키 (공개 값).
 // 구글 클라우드에서 YouTube Data API 전용 + seongjun123.github.io 에서만 쓰이도록 제한되어 있습니다.
 export const API_KEY = "AIzaSyC5HZxvL2xwyhG7iqTCqbPx6rAugH1C9ME";
-export const APP_VERSION = "1.5.0";
+// 시트 저장 계정 (업로드 기록 시트가 있는 계정). 앱 설정에서 [변경]을 누르지 않는 한 이 계정으로 고정.
+export const RECORD_ACCOUNT = "yunsj7060@gmail.com";
+export const APP_VERSION = "1.6.0";

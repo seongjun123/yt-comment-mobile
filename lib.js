@@ -5,10 +5,35 @@ export const STATUS = {
   DONE: "게시 완료",
   FAIL: "실패",
   SKIP: "건너뜀",
+  ALREADY: "이미 댓글 단 영상",   // 이 채널로 이미 댓글을 단 영상이라 게시하지 않음 (행 배경 초록)
 };
 
 // 앱이 관리하는 열 (없으면 시트 맨 오른쪽에 추가)
-export const MANAGED_COLUMNS = ["상태", "게시시각", "댓글링크", "게시채널", "오류", "공개확인"];
+export const MANAGED_COLUMNS = ["상태", "게시시각", "댓글링크", "게시채널", "오류", "공개확인", "기존댓글"];
+
+// 행 배경색 (파스텔): 안 보이는 댓글 = 빨강, 이미 댓글 단 영상이라 건너뜀 = 초록
+export const COLOR = {
+  hidden: { red: 0.957, green: 0.8, blue: 0.8 },        // #F4CCCC
+  already: { red: 0.851, green: 0.918, blue: 0.827 },   // #D9EAD3
+};
+
+/** 시트 가로줄 하나 전체 배경색 바꾸기 (batchUpdate 요청 1개). row는 1부터 */
+export function rowColorRequest(sheetId, row, color) {   // 열 범위를 안 주면 가로줄 전체
+  return {
+    repeatCell: {
+      range: { sheetId, startRowIndex: row - 1, endRowIndex: row },
+      cell: { userEnteredFormat: { backgroundColor: color } },
+      fields: "userEnteredFormat.backgroundColor",
+    },
+  };
+}
+
+/** '기존댓글' 칸 문구: "또이안이야 · 2026-10-23 01:00 · https://…&lc=…" */
+export function alreadyNote(prev, channelTitle) {
+  const at = String(prev && prev.at || "").trim();
+  const when = /^\d{4}-\d\d-\d\d \d\d:\d\d/.test(at) ? at.slice(0, 16) : (at || "시각 기록 없음");
+  return [channelTitle || (prev && prev.channelTitle) || "", when, (prev && prev.link) || ""].filter(Boolean).join(" · ");
+}
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
@@ -114,7 +139,7 @@ export function planManagedColumns(header, cols) {
 export function classifyRows(rows, cols, pos) {
   const get = (r, i) => (i >= 0 && i < r.length && r[i] != null ? String(r[i]).trim() : "");
   const items = [];
-  const counts = { target: 0, orphan: 0, done: 0, skip: 0, fail: 0, empty: 0, invalid: 0, dup: 0 };
+  const counts = { target: 0, orphan: 0, done: 0, skip: 0, fail: 0, empty: 0, invalid: 0, dup: 0, already: 0 };
   const seen = new Set();      // (영상, 댓글) — 이미 게시했거나 이번에 게시할 조합
   // 1차: 완료된 조합 수집
   rows.forEach((r) => {
@@ -134,12 +159,13 @@ export function classifyRows(rows, cols, pos) {
       title: get(r, cols.title), channel: get(r, cols.channel),
       postedAt: get(r, pos["게시시각"]), link: get(r, pos["댓글링크"]),
       postedBy: get(r, pos["게시채널"]), error: get(r, pos["오류"]),
-      visibility: get(r, pos["공개확인"]),
+      visibility: get(r, pos["공개확인"]), prevNote: get(r, pos["기존댓글"]),
     };
     let kind;
     if (!text) kind = url || status ? "empty" : null;
     else if (status === STATUS.DONE) kind = "done";
     else if (status === STATUS.SKIP) kind = "skip";
+    else if (status === STATUS.ALREADY) kind = "already";
     else if (!vid) kind = "invalid";
     else if (status === STATUS.POSTING) kind = "orphan";
     else {

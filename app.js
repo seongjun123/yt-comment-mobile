@@ -1,8 +1,8 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js?v=1.5.0";
-import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.5.0";
+import * as L from "./lib.js?v=1.6.0";
+import { CLIENT_ID, APP_VERSION, API_KEY, RECORD_ACCOUNT } from "./config.js?v=1.6.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
@@ -72,13 +72,15 @@ const valid = (t) => t && t.token && t.exp - now() > 60 * 1000;
 const channel = () => (S.current ? S.channels[S.current] : null);
 const isRealEmail = (e) => !!e && !/pages\.plusgoogle\.com$/i.test(e);
 
-// 시트용 토큰: '시트 저장 계정'이 정해져 있으면 그 계정만 쓴다 (만료돼도 다른 계정으로 대신하지 않음 —
-// 업로드 기록이 여러 계정에 나뉘는 것을 막기 위해). 아직 안 정했을 때만 본계정 채널 토큰을 쓴다.
+// 시트 저장 계정: 기본 yunsj7060 고정. 설정에서 [변경]을 눌러 다른 계정으로 로그인했을 때만 바뀐다.
+// 시트(업로드 시트·기록 시트)는 이 계정 토큰으로만 읽고 쓴다 — 기록이 여러 계정에 나뉘지 않게.
+const recordAccount = () => store.get("recordAccount", RECORD_ACCOUNT);
+const sameEmail = (a, b) => !!a && String(a).toLowerCase() === String(b || "").toLowerCase();
 function sheetToken() {
-  if (S.sheetAuth && S.sheetAuth.email) return valid(S.sheetAuth) ? S.sheetAuth : null;
-  if (valid(S.sheetAuth)) return S.sheetAuth;
+  const acct = recordAccount();
+  if (S.sheetAuth && sameEmail(S.sheetAuth.email, acct) && valid(S.sheetAuth)) return S.sheetAuth;
   const ch = channel();
-  if (ch && isRealEmail(ch.email) && valid(ch)) return { token: ch.token, exp: ch.exp, email: ch.email };
+  if (ch && sameEmail(ch.email, acct) && valid(ch)) return { token: ch.token, exp: ch.exp, email: ch.email };
   return null;
 }
 
@@ -111,9 +113,9 @@ function randomHex(n) {
   return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function startLogin(kind, { silent = false, hint = "" } = {}) {
+function startLogin(kind, { silent = false, hint = "", change = false } = {}) {
   const state = randomHex(16);
-  store.set("oauth", { state, kind, silent, at: now() });
+  store.set("oauth", { state, kind, silent, change, at: now() });
   const p = new URLSearchParams({
     client_id: CLIENT_ID,
     redirect_uri: REDIRECT_URI,
@@ -152,7 +154,7 @@ function readOAuthReturn() {
   }
   const granted = (h.get("scope") || "").split(" ");
   return {
-    ok: true, kind: saved.kind, silent: saved.silent,
+    ok: true, kind: saved.kind, silent: saved.silent, change: !!saved.change,
     token: h.get("access_token"),
     exp: now() + (Number(h.get("expires_in")) || 3600) * 1000,
     scopes: granted,
@@ -164,9 +166,14 @@ async function finishLogin(r) {
   if (r.kind === "sheet") {
     if (!r.scopes.includes(SCOPE_SHEETS)) throw new Error("시트 권한이 허용되지 않았습니다. 다시 로그인해서 모든 권한을 허용해주세요.");
     const { email, sub } = await fetchIdentity(r.token);
+    if (!sameEmail(email, recordAccount())) {
+      if (!r.change) throw new Error(`시트 저장 계정은 ${recordAccount()} 입니다. 그 계정을 선택해주세요. (다른 계정으로 바꾸려면 [변경])`);
+      store.set("recordAccount", email); store.del("record"); S.record = null;
+      log("시트 저장 계정 변경", email);
+      toast(`시트 저장 계정을 ${email}(으)로 바꿨습니다`, 5000);
+    } else toast(`시트 저장 계정: ${email}`);
     S.sheetAuth = { token: r.token, exp: r.exp, email, sub };
     persist();
-    toast(`시트 계정: ${email || "로그인됨"}`);
     return;
   }
   if (!r.scopes.includes(SCOPE_YT)) throw new Error("유튜브 권한이 허용되지 않았습니다. 다시 로그인해서 모든 권한을 허용해주세요.");
@@ -186,7 +193,7 @@ async function finishLogin(r) {
   if (!wrongChannel) S.current = ch.id;
   // 본계정 채널로 로그인했고 시트 권한이 있으면 시트 계정도 같이 채운다
   // 시트 저장 계정은 처음 한 번만 자동으로 정하고, 그 뒤엔 같은 계정일 때만 토큰을 새로 고친다 ([변경]으로만 바뀜)
-  if (isRealEmail(email) && r.scopes.includes(SCOPE_SHEETS) && (!S.sheetAuth || !S.sheetAuth.email || S.sheetAuth.email === email)) {
+  if (r.scopes.includes(SCOPE_SHEETS) && sameEmail(email, recordAccount())) {
     S.sheetAuth = { token: r.token, exp: r.exp, email, sub };
   }
   persist();
@@ -322,6 +329,7 @@ async function writeRow(row, fields) {
         if ("오류" in fields) it.error = fields["오류"];
         if ("게시채널" in fields) it.postedBy = fields["게시채널"];
         if ("공개확인" in fields) it.visibility = fields["공개확인"];
+        if ("기존댓글" in fields) it.prevNote = fields["기존댓글"];
       }
       return;
     } catch (e) {
@@ -470,6 +478,12 @@ async function writeVisibility(id, tabInfo, items) {
   for (let i = 0; i < data.length; i += 500) {
     await withSheet(`${SHEETS}/${id}/values:batchUpdate`, { method: "POST", body: { valueInputOption: "RAW", data: data.slice(i, i + 500) } });
   }
+  // 안 보이는 댓글: 가로줄 전체를 파스텔 빨강으로
+  const red = [];
+  for (const ti of tabInfo) for (const it of items) if (it.tab === ti.tab.title && it.verdict === "hidden") red.push(L.rowColorRequest(ti.tab.sheetId, it.row, L.COLOR.hidden));
+  for (let i = 0; i < red.length; i += 500) {
+    await withSheet(`${SHEETS}/${id}:batchUpdate`, { method: "POST", body: { requests: red.slice(i, i + 500) } }).catch((e) => log("빨간 줄 표시 실패", e.message));
+  }
 }
 
 const setCheckProg = (t) => { C.prog = t; const el = $("checkProg"); if (el) el.textContent = t; };
@@ -544,8 +558,8 @@ async function runCheck(id) {
 // 시트 계정 드라이브의 '댓글 업로드 기록' 시트 하나에 모든 채널의 게시를 모은다.
 // 폰·PC 어디서 올려도 같은 시트를 보므로, 한 채널이 같은 영상에 두 번 다는 것을 막는다.
 function recordCache() {
-  const r = store.get("record", null), st = sheetToken();
-  return r && st && r.email === st.email ? r : null;
+  const r = store.get("record", null);
+  return r && sameEmail(r.email, recordAccount()) ? r : null;
 }
 
 async function findOrCreateRecord({ create = true } = {}) {
@@ -583,11 +597,11 @@ async function loadRecord({ create = true } = {}) {
   let data;
   try { data = await withSheet(`${SHEETS}/${id}/values/A1:Z?majorDimension=ROWS`); }
   catch (e) {
-    if (!(e instanceof ApiError && (e.status === 404 || e.status === 403))) throw e;
-    store.del("record");                        // 지워졌거나 접근 불가 → 다시 찾기
-    id = await findOrCreateRecord({ create });
-    if (!id) return null;
-    data = await withSheet(`${SHEETS}/${id}/values/A1:Z?majorDimension=ROWS`);
+    // 고정된 기록 시트를 못 열면 새로 만들지 않고 멈춘다 (기록이 둘로 나뉘는 것 방지)
+    if (e instanceof ApiError && (e.status === 404 || e.status === 403)) {
+      throw new Error("업로드 기록 시트를 열 수 없습니다 (지워졌거나 권한 없음). 설정 → [기록 시트 다시 찾기]");
+    }
+    throw e;
   }
   const values = data.values || [];
   if (!values.length) {
@@ -753,7 +767,7 @@ function releaseWake() { try { S.wake && S.wake.release(); } catch { /* 무시 *
 const fresh = (t) => !!t && t.exp - now() > RENEW_MARGIN_MS;
 
 function hintFor(kind) {
-  if (kind === "sheet") { const a = S.sheetAuth; return a ? (a.email || a.sub || "") : ""; }
+  if (kind === "sheet") return recordAccount();
   const c = channel();
   return c ? (isRealEmail(c.email) ? c.email : (c.sub || "")) : "";
 }
@@ -763,7 +777,7 @@ function staleKind() {
   const ch = channel();
   if (ch && !fresh(ch)) return "channel";
   // 시트는 별도 시트 계정이 있을 때만 (본계정 채널이면 채널 토큰을 같이 씀)
-  const usesOwn = S.sheetAuth && !(ch && isRealEmail(ch.email) && S.sheetAuth.email === ch.email);
+  const usesOwn = S.sheetAuth && sameEmail(S.sheetAuth.email, recordAccount()) && !(ch && sameEmail(ch.email, recordAccount()));
   if (usesOwn && !fresh(S.sheetAuth)) return "sheet";
   return null;
 }
@@ -785,6 +799,24 @@ function renewIfNeeded() {
   store.set("run", { channelId: S.current, sheetId: S.currentSheet, at: now(), confirmed: true });
   if (trySilent(kind)) return true;
   return false;   // 방금 실패했으면 여기서는 그냥 진행(남은 시간 안에서), 만료되면 오류로 멈춤
+}
+
+/** 시트 가로줄 배경색 (여러 줄 한 번에). 실패해도 게시는 계속 */
+async function colorRows(sheetId, tabId, rows, color) {
+  if (!rows.length) return;
+  try {
+    await withSheet(`${SHEETS}/${sheetId}:batchUpdate`, { method: "POST", body: { requests: rows.map((r) => L.rowColorRequest(tabId, r, color)) } });
+  } catch (e) { log("행 색칠 실패", e.message); }
+}
+
+/** 이 채널로 이미 댓글 단 영상: 상태 '이미 댓글 단 영상' + 언제 달았는지 + 초록 배경 */
+async function markAlready(items, ch) {
+  for (const { it, prev } of items) {
+    const note = L.alreadyNote(prev, ch.title);
+    await writeRow(it.row, { "상태": L.STATUS.ALREADY, "기존댓글": note, "오류": "" }).catch(() => {});
+    it.kind = "already"; it.status = L.STATUS.ALREADY; it.prevNote = note;
+  }
+  await colorRows(S.sheet.id, S.sheet.tabId, items.map((x) => x.it.row), L.COLOR.already);
 }
 
 async function startRun({ resumed = false } = {}) {
@@ -826,22 +858,19 @@ async function startRun({ resumed = false } = {}) {
   let queue = S.sheet.items.filter((i) => i.kind === "target" || i.kind === "fail");
   if (!queue.length) { render(); toast("게시할 행이 없습니다"); return; }
 
-  // 1-2) 이 채널로 이미 댓글 단 영상 / 시트 안에서 같은 영상 반복 → 건너뜀
+  // 1-2) 이 채널로 이미 댓글 단 영상 → '이미 댓글 단 영상'(초록). 시트 안에서 같은 영상이 반복되면 첫 행이 달린 뒤 나머지가 같은 처리
   await ensureManagedColumns();
   const already = [], repeated = [];
   const seenVid = new Set();
   for (const it of queue) {
     const prev = S.record.index.has(me, it.vid);
-    const when = prev && /^\d{4}-\d\d-\d\d \d\d:\d\d/.test(prev.at) ? ` (${prev.at.slice(5, 16).replace("-", "/")})` : "";
-    const why = prev ? `${ch.title} 채널로 이미 댓글 단 영상${when}` : seenVid.has(it.vid) ? `같은 영상이 위 행에 또 있음 (채널당 1번만)` : "";
+    if (prev) already.push({ it, prev });
+    else if (seenVid.has(it.vid)) repeated.push(it);
     seenVid.add(it.vid);
-    if (!why) continue;
-    (prev ? already : repeated).push(it);
-    await writeRow(it.row, { "상태": L.STATUS.SKIP, "오류": why }).catch(() => {});
-    it.kind = "skip"; it.status = L.STATUS.SKIP; it.error = why;
   }
-  queue = queue.filter((i) => i.kind !== "skip");
-  if (!queue.length) { render(); toast(`게시할 행이 없습니다 (이미 단 영상 ${already.length + repeated.length}개 건너뜀)`, 5000); return; }
+  if (already.length) await markAlready(already, ch);
+  queue = queue.filter((i) => i.kind !== "already");
+  if (!queue.length) { render(); toast(`게시할 행이 없습니다 (이 채널로 이미 댓글 단 영상 ${already.length}개)`, 5000); return; }
 
   // 2) 영상 사전 확인
   setRunText("영상 확인 중…");
@@ -870,11 +899,11 @@ async function startRun({ resumed = false } = {}) {
     const avg = (S.delay.lo + S.delay.hi) / 2 * (S.longPause ? 1 - L.LONG_PAUSE.p : 1) + (S.longPause ? L.LONG_PAUSE.p * (L.LONG_PAUSE.lo + L.LONG_PAUSE.hi) / 2 : 0);
     const mins = Math.max(1, Math.round(((queue.length - 1) * avg) / 60));
     const reps = L.repeatedTexts(queue);
-    let html = `<div><b>${esc(ch.title)}</b> 채널로 댓글 <b>${queue.length}개</b>를 게시합니다.</div>
+    let html = `<div><b>${esc(ch.title)}</b> 채널로 댓글 <b>${queue.length - repeated.length}개</b>를 게시합니다.</div>
       <div class="muted small">시트: ${esc(S.sheet.title)} · 예상 약 ${mins}분 (간격 ${S.delay.lo}~${S.delay.hi}초${S.longPause ? ", 가끔 180~240초" : ""})</div>
       <div class="muted small">끝날 때까지 이 화면을 켜두세요.</div>`;
-    if (already.length) html += `<div class="muted small">이 채널로 이미 댓글 단 영상 ${already.length}개는 '건너뜀'으로 표시했습니다.</div>`;
-    if (repeated.length) html += `<div class="muted small">시트 안에서 같은 영상이 반복된 ${repeated.length}개는 첫 행만 게시하고 나머지는 '건너뜀'으로 표시했습니다.</div>`;
+    if (already.length) html += `<div class="muted small">이 채널로 이미 댓글 단 영상 ${already.length}개는 게시하지 않고 '이미 댓글 단 영상'(초록 줄)으로 표시했습니다.</div>`;
+    if (repeated.length) html += `<div class="muted small">시트에 같은 영상이 또 나오는 ${repeated.length}행은 첫 댓글이 달리면 자동으로 건너뜁니다.</div>`;
     if (skipped.length) html += `<div class="muted small">댓글 꺼짐·없는 영상 ${skipped.length}개는 '건너뜀'으로 표시했습니다.</div>`;
     if (queue.length > left) html += `<div class="warnline">오늘 남은 한도(약 ${left}개, 이 기기 기준)보다 많습니다. 한도에 닿으면 자동으로 멈춥니다.</div>`;
     if (reps.length) html += `<div class="warnline">같은 댓글이 여러 영상에 반복됩니다 (${reps.slice(0, 2).map((t) => "“" + esc(t.slice(0, 15)) + "”").join(", ")}). 스팸으로 걸러질 수 있습니다.</div>`;
@@ -893,10 +922,8 @@ async function startRun({ resumed = false } = {}) {
       if (S.stopReq) break;
       if (renewIfNeeded()) return;           // 로그인 갱신하러 이동 → 돌아오면 자동으로 이어감
       const it = queue[i];
-      if (alreadyPosted(it.vid)) {             // 실행 도중 다른 기기에서 단 경우 등 (마지막 안전장치)
-        await writeRow(it.row, { "상태": L.STATUS.SKIP, "오류": `${ch.title} 채널로 이미 댓글 단 영상` }).catch(() => {});
-        it.kind = "skip"; S.processed.push(it.row); continue;
-      }
+      const prevNow = alreadyPosted(it.vid);   // 시트 안 반복 행(첫 행이 방금 달림)·다른 기기에서 단 경우
+      if (prevNow) { await markAlready([{ it, prev: prevNow }], ch); S.processed.push(it.row); render(); continue; }
       S.postingRow = it.row;
       setProgress(i, total, `${i + 1}/${total} 게시 중…`);
       render();
@@ -990,7 +1017,7 @@ function showAuthBanner(kind) {
   b.innerHTML = `${isSheet ? "시트를 읽으려면 시트 권한이 있는 구글 계정 로그인이 필요합니다." : "로그인이 만료되었습니다."}
     <div><button class="primary small" id="btnRelogin">${isSheet ? "시트 계정 로그인" : "다시 로그인"}</button></div>`;
   b.classList.remove("hidden");
-  $("btnRelogin").onclick = () => startLogin(isSheet ? "sheet" : "channel", { hint: isSheet ? "" : (channel() && isRealEmail(channel().email) ? channel().email : "") });
+  $("btnRelogin").onclick = () => startLogin(isSheet ? "sheet" : "channel", { hint: isSheet ? recordAccount() : (channel() && isRealEmail(channel().email) ? channel().email : "") });
 }
 
 function renderAccount() {
@@ -1017,16 +1044,14 @@ function renderAccount() {
   btn.disabled = S.running;
 
   const sa = $("sheetAuth");
-  const st = sheetToken();
-  const fixed = S.sheetAuth && S.sheetAuth.email;
-  if (st) sa.innerHTML = `시트 저장 계정: <b>${esc(st.email || "로그인됨")}</b> <button class="ghost small" id="btnSheetLogin">변경</button>`;
-  else if (fixed) sa.innerHTML = `시트 저장 계정: <b>${esc(fixed)}</b> · 로그인 갱신 필요 <button class="small" id="btnSheetLogin">로그인</button>`;
-  else if (ch) sa.innerHTML = `시트 저장 계정: 없음 <button class="small" id="btnSheetLogin">시트 저장 계정 로그인</button>`;
-  else sa.innerHTML = "";
+  const st = sheetToken(), acct = recordAccount();
+  sa.innerHTML = `시트 저장 계정 (고정): <b>${esc(acct)}</b>` + (st ? "" : ` · 로그인 필요 <button class="small primary" id="btnSheetLogin">로그인</button>`)
+    + ` <button class="ghost small" id="btnSheetChange">변경</button>`;
   const b2 = $("btnSheetLogin");
-  if (b2) b2.onclick = () => {
-    if (st && !window.confirm("시트 저장 계정을 바꿀까요?\n업로드 기록 시트는 계정마다 따로라서, 다른 계정으로 바꾸면 그 계정의 기록 시트를 씁니다.")) return;
-    startLogin("sheet", { hint: st ? "" : (fixed || "") });
+  if (b2) b2.onclick = () => startLogin("sheet", { hint: acct });
+  $("btnSheetChange").onclick = () => {
+    if (!window.confirm(`시트 저장 계정을 ${acct}에서 다른 계정으로 바꿀까요?\n업로드 기록 시트도 새 계정의 것을 쓰게 됩니다. (그대로 두려면 취소)`)) return;
+    startLogin("sheet", { change: true });
   };
   if (!S.needLogin) $("authBanner").classList.add("hidden");
 }
@@ -1052,7 +1077,7 @@ function renderSheets() {
   const chip = (label, n) => (n ? `<span class="chip">${label} <b>${n}</b></span>` : "");
   sum.innerHTML = `<span class="chip">📄 ${esc(sh.tab)}</span>` + chip("대기", c.target + c.fail + c.orphan) + chip("완료", c.done)
     + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty)
-    + chip("이 채널로 이미 단 영상", sh.items.filter((i) => (i.kind === "target" || i.kind === "fail") && alreadyPosted(i.vid)).length);
+    + chip("이미 단 영상", c.already + sh.items.filter((i) => (i.kind === "target" || i.kind === "fail") && alreadyPosted(i.vid)).length);
   const reps = L.repeatedTexts(sh.items);
   if (reps.length) {
     w.textContent = `같은 댓글이 여러 영상에 반복됩니다 (“${reps[0].slice(0, 20)}”${reps.length > 1 ? ` 외 ${reps.length - 1}개` : ""}). 스팸으로 걸러질 가능성이 높습니다.`;
@@ -1062,6 +1087,7 @@ function renderSheets() {
 
 const VERDICT_ICON = { visible: "👁", hidden: "🚫", mixed: "⚠", gone: "✖" };
 const KIND_BADGE = {
+  already: ["이미 단 영상", "ok"],
   target: ["대기", ""], fail: ["재시도", "fail"], orphan: ["확인 필요", "fail"], done: ["✓ 완료", "ok"],
   skip: ["건너뜀", ""], dup: ["중복", ""], invalid: ["주소 오류", "fail"], empty: ["댓글 없음", ""],
 };
@@ -1075,6 +1101,7 @@ function renderList() {
   let items = sh.items.filter((i) => i.kind !== "empty");
   if (S.filter === "pending") items = items.filter((i) => ["target", "fail", "orphan"].includes(i.kind) || i.row === S.postingRow);
   if (S.filter === "done") items = items.filter((i) => S.processed.includes(i.row) || i.row === S.postingRow);
+  if (S.filter === "already") items = items.filter((i) => i.kind === "already" || ((i.kind === "target" || i.kind === "fail") && alreadyPosted(i.vid)));
   empty.classList.toggle("hidden", items.length > 0);
   empty.textContent = S.filter === "pending" ? "게시할 행이 없습니다. 시트의 '댓글' 칸을 채우고 새로고침하세요."
     : "아직 없습니다.";
@@ -1084,7 +1111,9 @@ function renderList() {
     const [label, cls] = posting ? ["게시 중", "run"] : dupe ? ["이미 단 영상", "fail"] : KIND_BADGE[it.kind] || [it.kind, ""];
     const title = it.title || it.url;
     const link = it.link ? ` · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a>` : "";
-    const err = it.error && it.kind !== "done" ? ` · ${esc(it.error)}` : "";
+    const noteHtml = (n) => { const parts = String(n || "").split(" · "); const url = /^https?:\/\//.test(parts.at(-1) || "") ? parts.pop() : "";
+      return esc(parts.join(" · ")) + (url ? ` · <a href="${esc(url)}" target="_blank" rel="noopener">기존 댓글</a>` : ""); };
+    const err = it.kind === "already" ? ` · 이미 댓글: ${noteHtml(it.prevNote)}` : it.error && it.kind !== "done" ? ` · ${esc(it.error)}` : "";
     const vs = L.visibilityState(it.visibility);
     const lastVis = (it.visibility || "").split("→").pop().trim();
     const vis = !vs ? "" : vs === "visible" ? ` · 👁 ${esc(lastVis)}` : ` · <b class="hid">${VERDICT_ICON[vs]} ${esc(lastVis)}</b>`;
@@ -1248,6 +1277,12 @@ function bind() {
     S.delay = { lo: Math.min(lo, hi), hi: Math.max(lo, hi) }; S.longPause = $("chkLong").checked; persist();
   };
   $("btnPickFolder").onclick = () => pickBackupFolder();
+  $("btnRefindRecord").onclick = async () => {
+    if (!window.confirm("기록 시트를 다시 찾을까요? 시트 저장 계정 드라이브에서 찾고, 없으면 새로 만들지 묻습니다.")) return;
+    store.del("record"); S.record = null;
+    try { await loadRecord(); toast("기록 시트를 연결했습니다"); } catch (e) { recordFail(e); }
+    renderSettingsInfo();
+  };
   $("btnBackupNow").onclick = () => backupNow({ manual: true });
   $("btnCopyLog").onclick = async () => {
     const text = [`버전 ${APP_VERSION}`, navigator.userAgent, ...logLines].join("\n");

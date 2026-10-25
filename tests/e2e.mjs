@@ -15,8 +15,11 @@ const accounts = {
   me: { token: "tok-me", email: "yunsj7060@gmail.com", channel: { id: "UC_ME", title: "yun sj", customUrl: "@yunsj" } },
   brand: { token: "tok-brand", email: "", channel: { id: "UC_BRAND", title: "또이안이야", customUrl: "@또이안이야" } },
   sheet: { token: "tok-sheet", email: "yunsj7060@gmail.com" },
+  other: { token: "tok-other", email: "biolab407@gmail.com" },
 };
-let pick = "me";            // 다음 로그인에서 고를 계정
+let pick = "me";
+let sheetPick = "sheet";     // 시트 로그인에서 고를 계정
+const colorReqs = [];        // 행 배경색 요청 {row, color}            // 다음 로그인에서 고를 계정
 let silentFails = false;    // prompt=none 실패 흉내
 let forceSilentKey = null;  // 자동 갱신이 다른 채널로 돌아오는 경우 흉내
 let nextExpires = null;     // 다음 로그인 토큰의 유효 시간(초) 한 번만 바꾸기
@@ -79,7 +82,7 @@ async function installMocks(page) {
       return route.fulfill({ status: 302, headers: { location: `${redirect}#error=interaction_required&state=${state}` } });
     }
     const isSheet = !p.get("scope").includes("youtube");
-    const key = isSheet ? "sheet" : (p.get("prompt") === "none" ? (forceSilentKey || tokenOwner.lastChannelKey || pick) : pick);
+    const key = isSheet ? sheetPick : (p.get("prompt") === "none" ? (forceSilentKey || tokenOwner.lastChannelKey || pick) : pick);
     const tok = `${accounts[key].token}-${++tokenSeq}`;
     tokenOwner[tok] = key;
     if (!isSheet) tokenOwner.lastChannelKey = key;
@@ -160,6 +163,7 @@ async function installMocks(page) {
       return json(route, 200, {});
     }
     if (path.endsWith(":batchUpdate")) {
+      for (const r of JSON.parse(req.postData()).requests) if (r.repeatCell) colorReqs.push({ row: r.repeatCell.range.startRowIndex + 1, whole: r.repeatCell.range.startColumnIndex == null, color: r.repeatCell.cell.userEnteredFormat.backgroundColor });
       for (const r of JSON.parse(req.postData()).requests) if (r.appendDimension) colCount += r.appendDimension.length;
       return json(route, 200, {});
     }
@@ -219,7 +223,7 @@ await page.waitForFunction(() => document.querySelector("#dlgTitle").textContent
 await page.screenshot({ path: `${OUT}/04-result.png` });
 await page.click("#dlgOk");
 check("2건 게시", posted.length === 2, JSON.stringify(posted));
-check("관리 열 추가", H().slice(7).join(",") === "상태,게시시각,댓글링크,게시채널,오류,공개확인", H().join(","));
+check("관리 열 추가", H().slice(7).join(",") === "상태,게시시각,댓글링크,게시채널,오류,공개확인,기존댓글", H().join(","));
 check("2행 게시 완료", cell(2, "상태") === "게시 완료" && cell(2, "댓글링크").includes("&lc=cmt"), cell(2, "상태"));
 check("2행 게시채널", cell(2, "게시채널") === "yun sj");
 check("3행(댓글 없음) 그대로", cell(3, "상태") === "");
@@ -369,14 +373,22 @@ check("목록에 '이미 단 영상' 표시", (await page.textContent("#list")).
 const p0 = posted.length;
 await page.click("#btnStart");
 await page.waitForSelector("#dlgConfirm[open]");
-check("확인 창에 이미 단 영상 안내", (await page.textContent("#dlgBody")).includes("이미 댓글 단 영상 2개") && (await page.textContent("#dlgBody")).includes("반복된 1개"), await page.textContent("#dlgBody"));
+check("확인 창에 이미 단 영상 안내", (await page.textContent("#dlgBody")).includes("이미 댓글 단 영상 2개") && (await page.textContent("#dlgBody")).includes("또 나오는 1행"), await page.textContent("#dlgBody"));
 await page.click("#dlgOk");
 await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
 await page.click("#dlgOk");
 check("같은 채널·같은 영상은 안 달림", posted.length === p0 + 1 && posted.at(-1).vid === "FFFFFFFFFFF", posted.slice(p0).map((p) => p.vid).join(","));
-check("이미 단 영상 → 건너뜀 + 이유", cell(dupRow, "상태") === "건너뜀" && /또이안이야 채널로 이미 댓글 단 영상 \(\d\d\/\d\d \d\d:\d\d\)/.test(cell(dupRow, "오류")), cell(dupRow, "오류"));
-check("시트 안 같은 영상 두 번째 → 건너뜀", cell(f2Row, "상태") === "건너뜀" && cell(f2Row, "오류").includes("채널당 1번"), cell(f2Row, "오류"));
-check("손으로 적은 기록도 막음", cell(gRow, "상태") === "건너뜀", cell(gRow, "오류"));
+check("이미 단 영상 → 따로 상태", cell(dupRow, "상태") === "이미 댓글 단 영상", cell(dupRow, "상태"));
+check("언제 달았는지 기록", /^또이안이야 · \d{4}-\d\d-\d\d \d\d:\d\d · https:\/\/www\.youtube\.com\/watch\?v=CCCCCCCCCCC&lc=/.test(cell(dupRow, "기존댓글")), cell(dupRow, "기존댓글"));
+check("시트 안 같은 영상 두 번째 → 첫 행 게시 후 이미 단 영상", cell(f2Row, "상태") === "이미 댓글 단 영상" && cell(f2Row, "기존댓글").includes("FFFFFFFFFFF"), cell(f2Row, "기존댓글"));
+check("손으로 적은 기록도 막음", cell(gRow, "상태") === "이미 댓글 단 영상" && cell(gRow, "기존댓글").includes("시각 기록 없음"), cell(gRow, "기존댓글"));
+const green = (r) => colorReqs.some((c) => c.row === r && c.whole && Math.abs(c.color.green - 0.918) < 0.01);
+check("이미 단 영상 줄 = 파스텔 초록(가로줄 전체)", green(dupRow) && green(f2Row) && green(gRow), JSON.stringify(colorReqs.slice(-4)));
+check("게시한 줄은 색칠 안 함", !colorReqs.some((c) => c.row === f2Row - 1));
+await page.click('.tab[data-filter="already"]');
+check("이미 단 영상 탭", (await page.locator("#list .item").count()) >= 3 && (await page.textContent("#list")).includes("또이안이야 · "), String(await page.locator("#list .item").count()));
+await page.screenshot({ path: `${OUT}/06a-already.png`, fullPage: true });
+await page.click('.tab[data-filter="pending"]');
 // 다른 채널(yun sj)은 같은 영상에 한 번 달 수 있음
 grid.push(mk("C", "C 영상", "CCCCCCCCCCC", "yun sj는 처음"));
 await page.selectOption("#selChannel", "UC_ME");
@@ -389,7 +401,20 @@ await page.click("#dlgOk");
 await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
 await page.click("#dlgOk");
 check("다른 채널은 같은 영상에 1번 가능", posted.at(-1).vid === "CCCCCCCCCCC" && posted.at(-1).by === "UC_ME");
-check("시트 저장 계정 표시·고정", (await page.textContent("#sheetAuth")).includes("시트 저장 계정") && (await page.textContent("#sheetAuth")).includes("yunsj7060@gmail.com"));
+check("시트 저장 계정 표시·고정", (await page.textContent("#sheetAuth")).includes("시트 저장 계정 (고정)") && (await page.textContent("#sheetAuth")).includes("yunsj7060@gmail.com"));
+// 다른 계정으로 시트 로그인이 돌아와도 바뀌지 않음 (기본 yunsj7060 고정)
+await page.selectOption("#selChannel", "UC_BRAND");
+await page.waitForFunction(() => document.querySelector("#acctTitle").textContent === "또이안이야");
+sheetPick = "other";
+await page.evaluate(() => { const a = JSON.parse(localStorage.getItem("ytm.sheetAuth")); a.exp = 0; localStorage.setItem("ytm.sheetAuth", JSON.stringify(a)); localStorage.removeItem("ytm.silentTry"); });
+await page.reload();
+await page.waitForFunction(() => document.querySelector("#sheetAuth")?.textContent.includes("로그인 필요"), null, { timeout: 10000 });
+check("다른 계정 시트 로그인 거부", (await page.textContent("#sheetAuth")).includes("yunsj7060@gmail.com") && (await page.evaluate(() => JSON.parse(localStorage.getItem("ytm.sheetAuth")).email)) === "yunsj7060@gmail.com");
+sheetPick = "sheet";
+await page.click("#btnSheetLogin");
+await page.waitForFunction(() => !document.querySelector("#sheetAuth")?.textContent.includes("로그인 필요"), null, { timeout: 10000 });
+check("yunsj7060으로 다시 로그인", true);
+await page.waitForSelector("#list .item, #emptyMsg:not(.hidden)");
 // 기록 시트가 없으면: 계정 확인 창 → 취소하면 게시 안 함 → 만들기 누르면 생성 + 기존 게시분 채움
 recordExists = false; recordGrid = [];
 await page.evaluate(() => localStorage.removeItem("ytm.record"));
@@ -446,6 +471,9 @@ await page.waitForFunction(() => document.querySelector("#checkProg")?.textConte
 await page.screenshot({ path: `${OUT}/07-check.png`, fullPage: true });
 check("보임 기록", cell(rv, "공개확인").startsWith("보임 ("), cell(rv, "공개확인"));
 check("안 보임 기록", cell(rh, "공개확인").startsWith("안 보임 ("), cell(rh, "공개확인"));
+const redRow = (r) => colorReqs.some((c) => c.row === r && c.whole && Math.abs(c.color.red - 0.957) < 0.01 && c.color.green < 0.85);
+check("안 보임 줄 = 파스텔 빨강(가로줄 전체)", redRow(rh), JSON.stringify(colorReqs.slice(-3)));
+check("보임·엇갈림 줄은 빨강 아님", !redRow(rv) && !redRow(rm));
 check("엇갈림 기록", cell(rm, "공개확인").startsWith("엇갈림 ("), cell(rm, "공개확인"));
 check("ID 조회는 키로 1번(50개 묶음)", publicCalls - pc0 === 1, String(publicCalls - pc0));
 check("영상별 최신순 목록 조회", listCalls - lc0 === new Set(doneRows.map(vidOf)).size, String(listCalls - lc0));

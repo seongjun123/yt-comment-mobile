@@ -41,7 +41,7 @@ test("findColumns: 관제탑 형식", () => {
   assert.equal(c.channel, 0);
   assert.equal(c.managed["상태"], -1);
   const plan = L.planManagedColumns(HEADER, c);
-  assert.deepEqual(plan.add.map((a) => [a.name, a.index]), [["상태", 7], ["게시시각", 8], ["댓글링크", 9], ["게시채널", 10], ["오류", 11], ["공개확인", 12]]);
+  assert.deepEqual(plan.add.map((a) => [a.name, a.index]), [["상태", 7], ["게시시각", 8], ["댓글링크", 9], ["게시채널", 10], ["오류", 11], ["공개확인", 12], ["기존댓글", 13]]);
 });
 
 test("findColumns: '댓글 수' 열은 댓글 열이 아니다", () => {
@@ -54,7 +54,7 @@ test("findColumns: 이미 관리 열이 있으면 그 위치 사용", () => {
   const h = [...HEADER, "상태", "게시시각", "댓글링크", "게시채널", "오류"];
   const c = L.findColumns(h, [row("a", "t", "dpjYK2UuYAY", "c", "게시 완료")]);
   assert.equal(c.managed["상태"], 7);
-  assert.deepEqual(L.planManagedColumns(h, c).add.map((a) => a.name), ["공개확인"]);   // 1.1.0에서 추가된 열만
+  assert.deepEqual(L.planManagedColumns(h, c).add.map((a) => a.name), ["공개확인", "기존댓글"]);   // 나중에 추가된 열만
 });
 
 test("classifyRows", () => {
@@ -206,4 +206,19 @@ test("업로드 기록 · 채널별 중복", () => {
   const files = L.backupFiles(values);
   assert.deepEqual(Object.keys(files).sort(), ["댓글업로드기록_또이안이야.csv", "댓글업로드기록_전체.csv"]);
   assert.ok(files["댓글업로드기록_전체.csv"].startsWith("﻿게시시각,채널ID"));
+});
+
+test("이미 단 영상 표시 · 행 색", () => {
+  assert.equal(L.alreadyNote({ at: "2026-10-23 01:00:05", link: "https://www.youtube.com/watch?v=a&lc=b" }, "또이안이야"),
+    "또이안이야 · 2026-10-23 01:00 · https://www.youtube.com/watch?v=a&lc=b");
+  assert.equal(L.alreadyNote({ at: "", link: "" }, "또이안이야"), "또이안이야 · 시각 기록 없음");
+  const rq = L.rowColorRequest(7, 5, L.COLOR.hidden);
+  assert.deepEqual(rq.repeatCell.range, { sheetId: 7, startRowIndex: 4, endRowIndex: 5 });   // 가로줄 통째로
+  assert.equal(rq.repeatCell.fields, "userEnteredFormat.backgroundColor");
+  const header = ["영상 링크", "댓글", "상태"];
+  const cols = L.findColumns(header, [["https://youtu.be/dpjYK2UuYAY", "x", "이미 댓글 단 영상"]]);
+  const plan = L.planManagedColumns(header, cols);
+  const c = L.classifyRows([["https://youtu.be/dpjYK2UuYAY", "x", "이미 댓글 단 영상"], ["https://youtu.be/HuaGOfzVBiU", "y", ""]], cols, plan.pos);
+  assert.deepEqual(c.items.map((i) => i.kind), ["already", "target"]);
+  assert.equal(c.counts.already, 1);
 });
