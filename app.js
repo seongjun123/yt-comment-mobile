@@ -1,8 +1,8 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js?v=1.3.0";
-import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.3.0";
+import * as L from "./lib.js?v=1.4.0";
+import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.4.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
@@ -42,7 +42,11 @@ const S = {
   sheetAuth: store.get("sheetAuth", null),   // { email, token, exp }
   sheets: store.get("sheets", []),           // [{ id, gid, title }]
   currentSheet: store.get("currentSheet", null),
-  delay: store.get("delay", { lo: 30, hi: 90 }),
+  delay: (() => {   // 예전 기본값(30~90초)을 그대로 쓰던 경우 새 기본값(60~120초)으로
+    const d = store.get("delay", null);
+    return !d || (d.lo === 30 && d.hi === 90) ? { ...L.DEFAULT_DELAY } : d;
+  })(),
+  longPause: store.get("longPause", true),   // 10% 확률 180~240초 긴 휴식
   usage: store.get("usage", {}),             // { "YYYY-MM-DD"(태평양 기준): n }
   mode: store.get("mode", "upload"),        // "upload" | "check"
   filter: "pending",
@@ -58,7 +62,7 @@ const S = {
 const persist = () => {
   store.set("channels", S.channels); store.set("current", S.current);
   store.set("sheetAuth", S.sheetAuth); store.set("sheets", S.sheets);
-  store.set("currentSheet", S.currentSheet); store.set("delay", S.delay); store.set("usage", S.usage);
+  store.set("currentSheet", S.currentSheet); store.set("delay", S.delay); store.set("longPause", S.longPause); store.set("usage", S.usage);
 };
 
 const now = () => Date.now();
@@ -451,8 +455,10 @@ async function writeVisibility(id, tabInfo, items) {
     }
     for (const it of items) {
       if (it.tab !== ti.tab.title) continue;
-      it.visibility = L.appendVisibility(it.visibility, it.verdict);
-      data.push({ range: `${q}!${L.colLetter(col)}${it.row}`, values: [[it.visibility]] });
+      const next = L.nextVisibility(it.visibility, it.verdict);
+      if (next === it.visibility && ti.visCol >= 0) continue;   // 그대로면 안 씀 (처음 안 보인 시각 고정)
+      it.visibility = next;
+      data.push({ range: `${q}!${L.colLetter(col)}${it.row}`, values: [[next]] });
     }
   }
   if (grow.length) await withSheet(`${SHEETS}/${id}:batchUpdate`, { method: "POST", body: { requests: grow } });
@@ -485,17 +491,21 @@ async function runCheck(id) {
     });
     if (!items.length) throw new Error("이 시트에는 검사할 댓글링크가 없습니다. 업로드 기록(댓글링크 열)이 있는 시트를 넣어주세요.");
 
+    // 이미 한 번 안 보인 댓글은 다시 조회하지 않음 — 처음 안 보인 시각을 그대로 둔다
+    for (const it of items) if (L.parseVisibility(it.visibility).hiddenAt != null) { it.sticky = true; it.verdict = "hidden"; it.byId = null; it.inList = null; }
+    const live = items.filter((x) => !x.sticky);
+
     // ① 댓글 ID로 직접 조회 (50개당 할당량 1)
-    setCheckProg(`댓글 ${items.length}개 조회 중…`);
+    setCheckProg(`댓글 ${live.length}개 조회 중…` + (items.length > live.length ? ` (이미 안 보인 ${items.length - live.length}개 제외)` : ""));
     const byId = new Set();
-    const ids = [...new Set(items.map((x) => x.cid))];
+    const ids = [...new Set(live.map((x) => x.cid))];
     for (let i = 0; i < ids.length; i += 50) {
       const res = await apiPublic(`${YT}/commentThreads?part=id&id=${ids.slice(i, i + 50).join(",")}&maxResults=50`);
       for (const t of res.items || []) byId.add(t.id);
     }
     // ② 영상별 최신순 목록 (영상당 할당량 1~5)
     const byVid = new Map();
-    for (const it of items) { if (!byVid.has(it.vid)) byVid.set(it.vid, []); byVid.get(it.vid).push(it); }
+    for (const it of live) { if (!byVid.has(it.vid)) byVid.set(it.vid, []); byVid.get(it.vid).push(it); }
     let n = 0;
     for (const [vid, list] of byVid) {
       let r = { found: new Set(), reached: false, gone: false };
@@ -635,10 +645,11 @@ async function startRun({ resumed = false } = {}) {
   // 3) 확인 창 (자동 이어가기일 땐 생략)
   const left = Math.max(0, DAILY_LIMIT - todayUsage());
   if (!resumed) {
-    const mins = Math.max(1, Math.round(((queue.length - 1) * (S.delay.lo + S.delay.hi)) / 2 / 60));
+    const avg = (S.delay.lo + S.delay.hi) / 2 * (S.longPause ? 1 - L.LONG_PAUSE.p : 1) + (S.longPause ? L.LONG_PAUSE.p * (L.LONG_PAUSE.lo + L.LONG_PAUSE.hi) / 2 : 0);
+    const mins = Math.max(1, Math.round(((queue.length - 1) * avg) / 60));
     const reps = L.repeatedTexts(queue);
     let html = `<div><b>${esc(ch.title)}</b> 채널로 댓글 <b>${queue.length}개</b>를 게시합니다.</div>
-      <div class="muted small">시트: ${esc(S.sheet.title)} · 예상 약 ${mins}분 (간격 ${S.delay.lo}~${S.delay.hi}초)</div>
+      <div class="muted small">시트: ${esc(S.sheet.title)} · 예상 약 ${mins}분 (간격 ${S.delay.lo}~${S.delay.hi}초${S.longPause ? ", 가끔 180~240초" : ""})</div>
       <div class="muted small">끝날 때까지 이 화면을 켜두세요.</div>`;
     if (skipped.length) html += `<div class="muted small">댓글 꺼짐·없는 영상 ${skipped.length}개는 '건너뜀'으로 표시했습니다.</div>`;
     if (queue.length > left) html += `<div class="warnline">오늘 남은 한도(약 ${left}개, 이 기기 기준)보다 많습니다. 한도에 닿으면 자동으로 멈춥니다.</div>`;
@@ -696,7 +707,9 @@ async function startRun({ resumed = false } = {}) {
       setProgress(i + 1, total, `${i + 1}/${total} 완료`);
       render();
       if (i < queue.length - 1 && !S.stopReq) {
-        const ms = L.randomDelay(S.delay.lo, S.delay.hi) * 1000;
+        const sec = L.nextDelay(S.delay.lo, S.delay.hi, S.longPause);
+        const ms = sec * 1000;
+        if (sec >= L.LONG_PAUSE.lo && S.longPause) log("긴 휴식", sec, "초");
         S.waitUntil = now() + ms;
         while (!S.stopReq && now() < S.waitUntil) {
           setRunText(`${i + 1}/${total} 완료 · 다음 게시까지 ${Math.ceil((S.waitUntil - now()) / 1000)}초`);
@@ -905,9 +918,9 @@ function renderCheck() {
     return `<li class="item">
       <div class="top"><div class="title">${esc(it.title || it.vid || "")}</div><span class="badge ${cls}">${label}</span></div>
       <div class="meta">${esc(it.tab)} ${it.row}행${it.channel ? " · " + esc(it.channel) : ""}${it.postedBy ? " · 게시: " + esc(it.postedBy) : ""}${it.postedAt ? " · " + esc(it.postedAt.slice(5, 16).replace("-", "/")) : ""}</div>
-      <div class="meta">ID 조회 ${ox(it.byId)} · 최신순 목록 ${ox(it.inList)} · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a></div>
+      <div class="meta">${it.sticky ? "이미 안 보인 댓글 (다시 조회 안 함)" : `ID 조회 ${ox(it.byId)} · 최신순 목록 ${ox(it.inList)}`} · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a></div>
       ${it.text ? `<div class="comment">${esc(it.text)}</div>` : ""}
-      <div class="meta">기록: ${esc(it.visibility)}</div>
+      <div class="meta">시트 기록: ${esc(it.visibility)}</div>
     </li>`;
   }).join("") : `<li class="empty muted">해당하는 댓글이 없습니다.</li>`;
 }
@@ -986,7 +999,7 @@ function bind() {
   $("btnStop").onclick = () => { S.stopReq = true; S.waitUntil = 0; setRunText("현재 행까지만 처리하고 멈춥니다…"); renderRunbar(); };
 
   $("btnSettings").onclick = () => {
-    $("inpLo").value = S.delay.lo; $("inpHi").value = S.delay.hi;
+    $("inpLo").value = S.delay.lo; $("inpHi").value = S.delay.hi; $("chkLong").checked = S.longPause;
     $("usageText").textContent = `오늘 이 기기에서 게시: ${todayUsage()}개 · 하루 한도 약 ${DAILY_LIMIT}개 (오후 4~5시경 초기화)`;
     $("verText").textContent = `버전 ${APP_VERSION}`;
     $("dlgSettings").showModal();
@@ -994,7 +1007,7 @@ function bind() {
   $("btnSettingsSave").onclick = () => {
     const lo = Math.max(0, Math.min(3600, parseInt($("inpLo").value, 10) || 0));
     const hi = Math.max(0, Math.min(3600, parseInt($("inpHi").value, 10) || 0));
-    S.delay = { lo: Math.min(lo, hi), hi: Math.max(lo, hi) }; persist();
+    S.delay = { lo: Math.min(lo, hi), hi: Math.max(lo, hi) }; S.longPause = $("chkLong").checked; persist();
   };
   $("btnCopyLog").onclick = async () => {
     const text = [`버전 ${APP_VERSION}`, navigator.userAgent, ...logLines].join("\n");

@@ -99,6 +99,17 @@ test("randomDelay 범위", () => {
   assert.equal(L.randomDelay(30, 90, () => 0), 30);
   assert.equal(L.randomDelay(30, 90, () => 1), 90);
   assert.equal(L.randomDelay(90, 30, () => 0), 30);
+  assert.deepEqual(L.DEFAULT_DELAY, { lo: 60, hi: 120 });
+  // 10% 확률 긴 휴식: 첫 난수 < 0.1 이면 180~240초
+  const seq = (...xs) => { let i = 0; return () => xs[i++]; };
+  assert.equal(L.nextDelay(60, 120, true, seq(0.05, 0)), 180);
+  assert.equal(L.nextDelay(60, 120, true, seq(0.09, 1)), 240);
+  assert.equal(L.nextDelay(60, 120, true, seq(0.1, 0)), 60);
+  assert.equal(L.nextDelay(60, 120, true, seq(0.5, 1)), 120);
+  assert.equal(L.nextDelay(0, 0, false, seq(0.01, 0.5)), 0);   // 끄면 긴 휴식 없음
+  let long = 0, n = 20000;
+  for (let i = 0; i < n; i++) { const d = L.nextDelay(60, 120); assert.ok((d >= 60 && d <= 120) || (d >= 180 && d <= 240)); if (d >= 180) long++; }
+  assert.ok(long / n > 0.08 && long / n < 0.12, String(long / n));
 });
 
 test("errorReason", () => {
@@ -138,12 +149,23 @@ test("공개 검사", () => {
   assert.equal(L.visVerdict(false, null), "hidden");
   assert.equal(L.visVerdict(false, null, true), "gone");
 
-  const now = Date.parse("2026-10-23T02:40:00+09:00");
-  assert.equal(L.appendVisibility("", "visible", now), "보임 (10/23 02:40)");
-  assert.equal(L.appendVisibility("보임 (10/23 02:40)", "hidden", now), "보임 (10/23 02:40) → 안 보임 (10/23 02:40)");
-  assert.equal(L.visibilityState("보임 (x) → 안 보임 (y)"), "hidden");
-  assert.equal(L.visibilityState("안 보임 (x) → 보임 (y)"), "visible");
-  assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");   // 예전 형식
-  assert.equal(L.visibilityState("엇갈림 (x)"), "mixed");
+  const t13 = Date.parse("2026-10-25T13:00:00+09:00"), t14 = Date.parse("2026-10-25T14:00:00+09:00");
+  assert.equal(L.nextVisibility("", "visible", t13), "보임 (최근 확인 10/25 13:00)");
+  assert.equal(L.nextVisibility("보임 (최근 확인 10/25 13:00)", "visible", t14), "보임 (최근 확인 10/25 14:00)");   // 최신화
+  assert.equal(L.nextVisibility("보임 (최근 확인 10/25 13:00)", "hidden", t14), "안 보임 (최초 10/25 14:00)");
+  assert.equal(L.nextVisibility("", "hidden", t13), "안 보임 (최초 10/25 13:00)");
+  // 처음 안 보인 시각은 고정: 14시에 다시 검사해도 13시 그대로 (다시 보이더라도)
+  assert.equal(L.nextVisibility("안 보임 (최초 10/25 13:00)", "hidden", t14), "안 보임 (최초 10/25 13:00)");
+  assert.equal(L.nextVisibility("안 보임 (최초 10/25 13:00)", "visible", t14), "안 보임 (최초 10/25 13:00)");
+  assert.equal(L.nextVisibility("엇갈림 (최근 확인 10/25 13:00)", "mixed", t14), "엇갈림 (최근 확인 10/25 14:00)");
+  // 예전 이력 형식 → 처음 안 보인 시각을 뽑아 새 형식으로
+  assert.equal(L.nextVisibility("보임 (10/23 02:43) → 안 보임 (10/24 09:10) → 보임 (10/24 10:00)", "visible", t14), "안 보임 (최초 10/24 09:10)");
+  assert.equal(L.nextVisibility("1차 보임 (10/23 01:05) → 2차 안 보임 (10/24 01:10)", "hidden", t14), "안 보임 (최초 10/24 01:10)");
+  assert.equal(L.nextVisibility("1차 보임 (10/23 01:05)", "visible", t14), "보임 (최근 확인 10/25 14:00)");
+  assert.deepEqual(L.parseVisibility("안 보임 (최초 10/25 13:00)"), { state: "hidden", hiddenAt: "10/25 13:00" });
+  assert.equal(L.visibilityState("보임 (최근 확인 x)"), "visible");
+  assert.equal(L.visibilityState("엇갈림 (최근 확인 x)"), "mixed");
+  assert.equal(L.visibilityState("영상/댓글창 없음 (최근 확인 x)"), "gone");
+  assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");
   assert.equal(L.visibilityState(""), "");
 });

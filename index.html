@@ -13,7 +13,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="style.css?v=1.3.0">
+  <link rel="stylesheet" href="style.css?v=1.4.0">
 </head>
 <body>
   <header class="topbar">
@@ -91,7 +91,7 @@
       <section class="card">
         <h2>댓글 공개 검사</h2>
         <p class="muted small">업로드 기록(댓글링크)이 남은 시트를 넣으면, 로그인 안 한 사람(시크릿 창) 기준으로 댓글이 보이는지 지금 바로 검사합니다.
-          결과는 시트의 '공개확인' 열에 이어서 기록됩니다.</p>
+          결과는 시트의 '공개확인' 열에 최신 상태로 기록됩니다. 한 번 안 보인 댓글은 처음 안 보인 시각을 그대로 남깁니다.</p>
         <form id="formCheckAdd" class="row gap">
           <input id="inpCheck" type="url" inputmode="url" autocomplete="off" placeholder="시트 링크 붙여넣기">
           <button type="submit" class="primary">추가</button>
@@ -147,6 +147,9 @@
           <input id="inpHi" type="number" min="0" max="3600" inputmode="numeric">
         </span>
       </label>
+      <label class="check-opt small"><input type="checkbox" id="chkLong">
+        <span>가끔 긴 휴식 <span class="muted">(10% 확률로 180~240초 쉬고 게시)</span></span></label>
+      <p class="muted tiny">기본값: 60~120초 무작위 + 가끔 긴 휴식</p>
       <div class="muted small" id="usageText"></div>
       <hr>
       <div class="row gap wrap">
@@ -160,6 +163,6 @@
   </dialog>
 
   <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="app.js?v=1.3.0"></script>
+  <script type="module" src="app.js?v=1.4.0"></script>
 </body>
 </html>

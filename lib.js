@@ -179,6 +179,16 @@ export function kstStamp(date = new Date()) {
   return s.replace("T", " ");
 }
 
+// 기본 간격: 60~120초 무작위, 10% 확률로 180~240초 긴 휴식
+export const DEFAULT_DELAY = { lo: 60, hi: 120 };
+export const LONG_PAUSE = { p: 0.1, lo: 180, hi: 240 };
+
+/** 다음 댓글까지 기다릴 초. longPause면 10% 확률로 180~240초 */
+export function nextDelay(lo, hi, longPause = true, rnd = Math.random) {
+  if (longPause && rnd() < LONG_PAUSE.p) return randomDelay(LONG_PAUSE.lo, LONG_PAUSE.hi, rnd);
+  return randomDelay(lo, hi, rnd);
+}
+
 export function randomDelay(lo, hi, rnd = Math.random) {
   const a = Math.max(0, Math.min(lo, hi)), b = Math.max(lo, hi, 0);
   return Math.round(a + (b - a) * rnd());
@@ -262,23 +272,45 @@ export function visVerdict(byId, inList, videoGone = false) {
 
 export const VERDICT_WORD = { visible: "보임", hidden: "안 보임", mixed: "엇갈림", gone: "영상/댓글창 없음" };
 
-/** '공개확인' 칸에 검사 기록을 덧붙인다. 같은 칸에 이력이 쌓인다: "보임 (10/23 02:40) → 안 보임 (10/24 09:10)" */
-export function appendVisibility(prev, verdict, nowMs = Date.now()) {
-  const when = kstStamp(new Date(nowMs)).slice(5, 16).replace("-", "/");   // "10/23 02:40"
-  const entry = `${VERDICT_WORD[verdict] || verdict} (${when})`;
-  const old = String(prev || "").trim();
-  return old ? `${old} → ${entry}` : entry;
+const shortStamp = (nowMs) => kstStamp(new Date(nowMs)).slice(5, 16).replace("-", "/");   // "10/25 13:00"
+
+/**
+ * '공개확인' 칸 해석. 반환 { state, hiddenAt }
+ *  hiddenAt: 처음 '안 보임'으로 확인된 시각 문자열("10/25 13:00") — 한 번이라도 안 보였으면 있음.
+ *  예전 형식("1차 보임 (…) → 2차 안 보임 (…)", "보임 (…) → 안 보임 (…)")도 읽는다.
+ */
+export function parseVisibility(v) {
+  const text = String(v || "").trim();
+  if (!text) return { state: "", hiddenAt: null };
+  let hiddenAt = null;
+  for (const part of text.split("→")) {
+    if (part.includes("안 보임")) {
+      const m = part.match(/\(([^)]*)\)/);
+      hiddenAt = m ? m[1].replace(/^\s*(최초|최근 확인)\s*/, "").trim() : "";
+      break;
+    }
+  }
+  if (hiddenAt != null) return { state: "hidden", hiddenAt };
+  const last = text.split("→").pop();
+  const state = last.includes("엇갈림") ? "mixed" : last.includes("영상/댓글창 없음") ? "gone" : last.includes("보임") ? "visible" : "";
+  return { state, hiddenAt: null };
 }
 
-/** 마지막 기록 기준 상태: "visible" | "hidden" | "mixed" | "gone" | "" (예전 '1차/2차' 형식도 읽음) */
+/**
+ * 검사 결과로 '공개확인' 칸을 최신 상태로 바꾼다 (이력을 쌓지 않음).
+ *  - 한 번 안 보인 댓글: "안 보임 (최초 10/25 13:00)" — 처음 안 보인 시각을 고정, 이후 검사해도 안 바뀜
+ *  - 그 외: "보임 (최근 확인 10/25 14:00)" 처럼 마지막 검사 결과와 시각
+ */
+export function nextVisibility(prev, verdict, nowMs = Date.now()) {
+  const p = parseVisibility(prev);
+  if (p.hiddenAt != null) return `안 보임 (최초 ${p.hiddenAt || shortStamp(nowMs)})`;
+  if (verdict === "hidden") return `안 보임 (최초 ${shortStamp(nowMs)})`;
+  return `${VERDICT_WORD[verdict] || verdict} (최근 확인 ${shortStamp(nowMs)})`;
+}
+
+/** 마지막 상태: "visible" | "hidden" | "mixed" | "gone" | "" (한 번이라도 안 보였으면 hidden) */
 export function visibilityState(v) {
-  if (!v) return "";
-  const last = v.split("→").pop();
-  if (last.includes("엇갈림")) return "mixed";
-  if (last.includes("영상/댓글창 없음")) return "gone";
-  if (last.includes("안 보임")) return "hidden";
-  if (last.includes("보임")) return "visible";
-  return "";
+  return parseVisibility(v).state;
 }
 
 /** 시트 제목 그대로, 없으면 ID 앞부분 */

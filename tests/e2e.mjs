@@ -183,7 +183,9 @@ check("대기 행 4개 (댓글 빈 행 제외)", pendingCount === 4, String(pend
 
 // 간격 0초
 await page.click("#btnSettings");
-await page.fill("#inpLo", "0"); await page.fill("#inpHi", "0");
+check("기본 간격 60~120초", (await page.inputValue("#inpLo")) === "60" && (await page.inputValue("#inpHi")) === "120");
+check("긴 휴식 기본 켜짐", await page.isChecked("#chkLong"));
+await page.fill("#inpLo", "0"); await page.fill("#inpHi", "0"); await page.uncheck("#chkLong");
 await page.click("#btnSettingsSave");
 
 // 3) 게시
@@ -357,12 +359,24 @@ check("문제 탭 기본 선택", (await page.getAttribute('#checkTabs .tab.acti
 const probCards = await page.locator("#checkList .item").count();
 check("문제 탭에 안 보임+엇갈림", probCards === 2, String(probCards));
 check("카드 요약 표시", (await page.textContent(".sheet-card .meta")).includes(`${doneRows.length}개 중`), await page.textContent(".sheet-card .meta"));
-// 다시 검사하면 이력이 이어진다
-hiddenIds.clear(); listHidden.clear();
+// 다시 검사: 보이는 건 최신 시각으로, 한 번 안 보인 건 처음 시각 고정 (다시 조회도 안 함)
+const firstHidden = cell(rh, "공개확인");
+check("안 보임 = 최초 시각", /^안 보임 \(최초 \d\d\/\d\d \d\d:\d\d\)$/.test(firstHidden), firstHidden);
+check("보임 = 최근 확인 시각", /^보임 \(최근 확인 /.test(cell(rv, "공개확인")), cell(rv, "공개확인"));
+setCell(`x!${String.fromCharCode(65 + H().indexOf("공개확인"))}${rv}`, "보임 (최근 확인 01/01 00:00)");   // 예전 확인 시각으로 바꿔 둠
+setCell(`x!${String.fromCharCode(65 + H().indexOf("공개확인"))}${rh}`, "안 보임 (최초 01/01 09:00)");
+hiddenIds.clear(); listHidden.clear();         // 숨겼던 게 다시 보이는 상황이어도
+const lcA = listCalls;
 await page.click('.sheet-card button[data-act="run"]');
 await page.waitForFunction(() => document.querySelector("#checkProg")?.textContent.startsWith("검사 완료"), null, { timeout: 15000 });
-check("이력 이어 쓰기", /^안 보임 \(.+\) → 보임 \(/.test(cell(rh, "공개확인")), cell(rh, "공개확인"));
-check("모두 보이면 전체 탭", (await page.getAttribute('#checkTabs .tab.active', "data-cf")) === "all");
+check("안 보인 시각 고정", cell(rh, "공개확인") === "안 보임 (최초 01/01 09:00)", cell(rh, "공개확인"));
+check("보임은 최신 시각으로 갱신", cell(rv, "공개확인").startsWith("보임 (최근 확인 ") && !cell(rv, "공개확인").includes("01/01"), cell(rv, "공개확인"));
+check("이력 쌓지 않음", !cell(rv, "공개확인").includes("→"), cell(rv, "공개확인"));
+check("엇갈림 → 보임 최신화", cell(rm, "공개확인").startsWith("보임 (최근 확인"), cell(rm, "공개확인"));
+const vidsLive = new Set(doneRows.filter((r) => r !== rh).map(vidOf));
+check("이미 안 보인 댓글만 있는 영상은 목록 조회 안 함", listCalls - lcA === vidsLive.size, `${listCalls - lcA} vs ${vidsLive.size}`);
+check("문제 탭 유지(안 보임 1)", (await page.getAttribute('#checkTabs .tab.active', "data-cf")) === "problem");
+check("결과 카드에 고정 표시", (await page.textContent("#checkList")).includes("다시 조회 안 함"));
 // 정밀 검사 끄면 목록 조회 안 함
 await page.uncheck("#chkDeep");
 const lc1 = listCalls;
