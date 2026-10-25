@@ -198,3 +198,6 @@ body.mode-check .toast { bottom: 24px; }
 .sheet-card .row { margin-top: 6px; }
 .check-prog { min-height: 20px; margin: 4px 2px 8px; }
 .legend { margin: 10px 2px 0; }
+
+#dlgSettings .field + .field { margin-top: 14px; }
+#dlgSettings .field .row { margin-top: 2px; }

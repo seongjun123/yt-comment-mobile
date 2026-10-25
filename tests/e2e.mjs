@@ -42,11 +42,19 @@ const videos = {
   BBBBBBBBBBB: { t: "꺼진 영상", c: "X", on: false },
   CCCCCCCCCCC: { t: "C 영상", c: "C", on: true },
   DDDDDDDDDDD: { t: "D 영상", c: "D", on: true },
+  EEEEEEEEEEE: { t: "E 영상", c: "E", on: true },
+  FFFFFFFFFFF: { t: "F 영상", c: "F", on: true },
+  GGGGGGGGGGG: { t: "G 영상", c: "G", on: true },
+  HHHHHHHHHHH: { t: "H 영상", c: "H", on: true },
 };
 const posted = [];          // {by, vid, text, id}
 const hiddenIds = new Set(); // 남에게 안 보이는 댓글 (ID 조회에서 안 나옴)
 const listHidden = new Set(); // 최신순 목록에서만 안 나오는 댓글 (엇갈림 흉내)
 let listCalls = 0;
+const REC_ID = "1RecordSheetIdRecordSheetIdRecord000000000";
+let recordExists = true;   // 기본: 이미 있음 (만들기 확인 창은 따로 테스트)
+let recordGrid = [];
+let driveCalls = 0;
 let publicCalls = 0;
 
 function colIndex(letters) { let n = 0; for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; }
@@ -122,11 +130,25 @@ async function installMocks(page) {
     }
     json(route, 404, {});
   });
+  await page.route("https://www.googleapis.com/drive/v3/**", (route) => {
+    const req = route.request(), k = who(req);
+    if (!k) return json(route, 401, { error: { message: "auth" } });
+    if (k === "brand") return json(route, 403, { error: { message: "brand" } });
+    driveCalls++;
+    json(route, 200, { files: recordExists ? [{ id: REC_ID, name: "댓글 업로드 기록 (댓글 도우미)" }] : [] });
+  });
   await page.route("https://sheets.googleapis.com/**", (route) => {
     const req = route.request(), u = new URL(req.url()), k = who(req);
     if (!k) return json(route, 401, { error: { message: "auth" } });
     if (k === "brand") return json(route, 403, { error: { status: "PERMISSION_DENIED", message: "The caller does not have permission" } });
     const path = decodeURIComponent(u.pathname);
+    if (path.endsWith("/v4/spreadsheets") && req.method() === "POST") { recordExists = true; recordGrid = []; return json(route, 200, { spreadsheetId: REC_ID }); }
+    if (path.includes(`/spreadsheets/${REC_ID}`)) {
+      if (!recordExists) return json(route, 404, { error: { message: "nf" } });
+      if (path.endsWith(":append")) { recordGrid.push(...JSON.parse(req.postData()).values); return json(route, 200, {}); }
+      if (req.method() === "PUT") { recordGrid[0] = JSON.parse(req.postData()).values[0]; return json(route, 200, {}); }
+      return json(route, 200, { values: recordGrid.map((r) => [...r]) });
+    }
     if (path.endsWith(`/spreadsheets/${SHEET_ID}`)) {
       return json(route, 200, { properties: { title: "관제탑_롱폼" }, sheets: [{ properties: { sheetId: 0, title: "시트1", index: 0, gridProperties: { columnCount: colCount } } }] });
     }
@@ -299,7 +321,7 @@ check("수동 로그인 후 게시", posted.length === n1 + 1 && posted.at(-1).t
 await page.click("#dlgOk");
 
 // 8-3) 시작 버튼을 눌렀을 때 곧 만료면: 갱신 → 돌아와서 확인 창 → 게시
-grid.push(mk("C", "C 영상", "CCCCCCCCCCC", "시작 시 갱신 테스트"));
+grid.push(mk("E", "E 영상", "EEEEEEEEEEE", "시작 시 갱신 테스트"));
 nextExpires = 186;                            // 3분 6초짜리 토큰으로 로그인 → 몇 초 뒤 '곧 만료'
 await page.click("#btnLogin");
 await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
@@ -324,6 +346,78 @@ forceSilentKey = null;
 await page.click("#btnRelogin");
 await page.waitForFunction(() => document.querySelector("#acctSub")?.textContent.includes("로그인 유지 중"), null, { timeout: 10000 });
 await page.waitForSelector(".item, #emptyMsg:not(.hidden)");
+
+// 8-5) 업로드 기록 · 채널별 중복 방지
+const recIdx = (name) => (recordGrid[0] || []).indexOf(name);
+check("기록 시트 머리글", (recordGrid[0] || []).join(",") === "게시시각,채널ID,채널명,영상ID,영상 제목,영상 채널,댓글,댓글링크,원본 시트", (recordGrid[0] || []).join(","));
+check("게시마다 기록 (채널ID 포함)", recordGrid.length - 1 === posted.filter((p) => p.id !== "cmtOld").length + 1
+  && recordGrid.slice(1).every((r) => r[recIdx("채널ID")].startsWith("UC_")), `${recordGrid.length - 1} vs ${posted.length}`);
+check("끊긴 행 복구분도 기록", recordGrid.some((r) => r[recIdx("영상ID")] === "DDDDDDDDDDD" && r[recIdx("채널ID")] === "UC_BRAND"));
+// 지금 채널 = 또이안이야. C 영상엔 이미 달았음 → 건너뜀
+grid.push(mk("C", "C 영상", "CCCCCCCCCCC", "또 달면 안 되는 댓글"));
+const dupRow = grid.length;
+grid.push(mk("F", "F 영상", "FFFFFFFFFFF", "F 첫 댓글"));
+grid.push(mk("F", "F 영상", "FFFFFFFFFFF", "F 두 번째 (막혀야 함)"));
+const f2Row = grid.length;
+recordGrid.push(["", "", "또이안이야", "", "", "", "", "https://youtu.be/GGGGGGGGGGG", ""]);   // 손으로 적은 기록
+grid.push(mk("G", "G 영상", "GGGGGGGGGGG", "수동 기록 영상 (막혀야 함)"));
+const gRow = grid.length;
+await page.click("#btnRefresh");
+await page.waitForSelector(".item");
+await page.waitForTimeout(800);
+check("목록에 '이미 단 영상' 표시", (await page.textContent("#list")).includes("이미 단 영상"));
+const p0 = posted.length;
+await page.click("#btnStart");
+await page.waitForSelector("#dlgConfirm[open]");
+check("확인 창에 이미 단 영상 안내", (await page.textContent("#dlgBody")).includes("이미 댓글 단 영상 2개") && (await page.textContent("#dlgBody")).includes("반복된 1개"), await page.textContent("#dlgBody"));
+await page.click("#dlgOk");
+await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
+await page.click("#dlgOk");
+check("같은 채널·같은 영상은 안 달림", posted.length === p0 + 1 && posted.at(-1).vid === "FFFFFFFFFFF", posted.slice(p0).map((p) => p.vid).join(","));
+check("이미 단 영상 → 건너뜀 + 이유", cell(dupRow, "상태") === "건너뜀" && /또이안이야 채널로 이미 댓글 단 영상 \(\d\d\/\d\d \d\d:\d\d\)/.test(cell(dupRow, "오류")), cell(dupRow, "오류"));
+check("시트 안 같은 영상 두 번째 → 건너뜀", cell(f2Row, "상태") === "건너뜀" && cell(f2Row, "오류").includes("채널당 1번"), cell(f2Row, "오류"));
+check("손으로 적은 기록도 막음", cell(gRow, "상태") === "건너뜀", cell(gRow, "오류"));
+// 다른 채널(yun sj)은 같은 영상에 한 번 달 수 있음
+grid.push(mk("C", "C 영상", "CCCCCCCCCCC", "yun sj는 처음"));
+await page.selectOption("#selChannel", "UC_ME");
+await page.waitForFunction(() => document.querySelector("#acctTitle").textContent === "yun sj");
+await page.click("#btnRefresh");
+await page.waitForSelector(".item");
+await page.click("#btnStart");
+await page.waitForSelector("#dlgConfirm[open]");
+await page.click("#dlgOk");
+await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
+await page.click("#dlgOk");
+check("다른 채널은 같은 영상에 1번 가능", posted.at(-1).vid === "CCCCCCCCCCC" && posted.at(-1).by === "UC_ME");
+check("시트 저장 계정 표시·고정", (await page.textContent("#sheetAuth")).includes("시트 저장 계정") && (await page.textContent("#sheetAuth")).includes("yunsj7060@gmail.com"));
+// 기록 시트가 없으면: 계정 확인 창 → 취소하면 게시 안 함 → 만들기 누르면 생성 + 기존 게시분 채움
+recordExists = false; recordGrid = [];
+await page.evaluate(() => localStorage.removeItem("ytm.record"));
+grid.push(mk("H", "H 영상", "HHHHHHHHHHH", "기록 시트 새로 만든 뒤"));
+await page.click("#btnRefresh");
+await page.waitForSelector(".item");
+const p1 = posted.length;
+await page.click("#btnStart");
+await page.waitForSelector("#dlgConfirm[open]");
+check("새 기록 시트 만들기 전 계정 확인", (await page.textContent("#dlgTitle")) === "업로드 기록 시트 만들기" && (await page.textContent("#dlgBody")).includes("yunsj7060@gmail.com"));
+await page.click('#dlgConfirm button[value="cancel"]');
+await page.waitForTimeout(600);
+check("취소하면 만들지도 게시하지도 않음", !recordExists && posted.length === p1);
+await page.click("#btnStart");
+await page.waitForSelector("#dlgConfirm[open]");
+await page.click("#dlgOk");                          // 만들기
+await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "게시할까요?", null, { timeout: 10000 });
+await page.click("#dlgOk");
+await page.waitForFunction(() => document.querySelector("#dlgTitle")?.textContent === "결과" && document.querySelector("#dlgConfirm")?.open, null, { timeout: 20000 });
+await page.click("#dlgOk");
+check("새 기록 시트 생성 + 게시", recordExists && posted.at(-1).vid === "HHHHHHHHHHH");
+check("기존 시트의 게시 완료분을 새 기록에 채움", recordGrid.length - 1 >= 6 && recordGrid.some((r) => r[recIdx("영상ID")] === "dpjYK2UuYAY" && r[recIdx("채널ID")] === "UC_ME"), String(recordGrid.length - 1));
+// 설정에 기록 표시
+await page.click("#btnSettings");
+await page.waitForTimeout(300);
+check("설정에 기록 건수·시트 링크", (await page.textContent("#recordText")).includes("건") && !(await page.getAttribute("#lnkRecord", "hidden") !== null), await page.textContent("#recordText"));
+await page.screenshot({ path: `${OUT}/06b-settings-record.png` });
+await page.click("#btnSettingsSave");
 
 // 9) 공개 검사 (별도 모드): 시트 링크 넣고 지금 바로 검사
 check("업로드 화면에는 공개 확인 버튼 없음", (await page.locator("#btnVis").count()) === 0);
@@ -391,6 +485,45 @@ check("새로고침 후 공개 검사 모드 유지", await page.isVisible("#che
 await page.click('.mode[data-mode="upload"]');
 await page.waitForSelector("#sheetCard");
 check("업로드로 돌아오면 게시 바 보임", await page.isVisible(".runbar"));
+
+// 9-2) PC 폴더 백업 (PC 브라우저의 폴더 권한 흉내)
+await page.click("#btnSettings");
+const hasFsApi = await page.evaluate(() => typeof window.showDirectoryPicker === "function");
+check("폴더 API 없으면 백업 항목 숨김 (있으면 보임)", (await page.isVisible("#backupField")) === hasFsApi, String(hasFsApi));
+await page.click("#btnSettingsSave");
+await page.addInitScript(() => {
+  window.__files = {}; window.__perm = "granted";
+  window.showDirectoryPicker = async () => ({
+    name: "확인할 작업물", kind: "directory",
+    queryPermission: async () => window.__perm,
+    requestPermission: async () => (window.__perm = "granted"),
+    getFileHandle: async (name) => ({ createWritable: async () => { let buf = ""; return { write: async (t) => { buf += t; }, close: async () => { window.__files[name] = buf; } }; } }),
+  });
+});
+await page.reload();
+await page.click('.mode[data-mode="upload"]');
+await page.waitForFunction(() => document.querySelector("#summary")?.textContent.includes("완료"), null, { timeout: 10000 });
+await page.click("#btnSettings");
+check("PC에선 백업 항목 보임", await page.isVisible("#backupField"));
+await page.click("#btnPickFolder");
+await page.waitForFunction(() => Object.keys(window.__files).length > 0, null, { timeout: 8000 });
+const files = await page.evaluate(() => window.__files);
+check("전체 + 채널별 CSV", ["댓글업로드기록_전체.csv", "댓글업로드기록_또이안이야.csv", "댓글업로드기록_yun sj.csv"].every((n) => n in files), Object.keys(files).join(", "));
+check("CSV 내용(BOM+머리글+행)", files["댓글업로드기록_전체.csv"].startsWith("\uFEFF게시시각,채널ID") && files["댓글업로드기록_전체.csv"].split("\r\n").length - 2 === recordGrid.length - 1, String(files["댓글업로드기록_전체.csv"].split("\r\n").length));
+check("채널별 파일엔 그 채널만", !files["댓글업로드기록_yun sj.csv"].includes(",UC_BRAND,"));
+await page.screenshot({ path: `${OUT}/06c-backup.png` });
+await page.click("#btnSettingsSave");
+// 권한이 풀린 상태면 저장하지 않고 안내
+await page.evaluate(() => { window.__files = {}; window.__perm = "prompt"; });
+await page.click("#btnRefresh");
+await page.waitForTimeout(1500);
+check("권한 없으면 자동 저장 안 함", Object.keys(await page.evaluate(() => window.__files)).length === 0);
+await page.click("#btnSettings");
+check("권한 다시 허용 안내", (await page.textContent("#backupText")).includes("권한 다시 허용"), await page.textContent("#backupText"));
+await page.click("#btnBackupNow");                 // 누르면 권한 요청 → 저장
+await page.waitForFunction(() => Object.keys(window.__files).length > 0, null, { timeout: 8000 });
+check("[지금 백업]으로 권한 허용 후 저장", true);
+await page.click("#btnSettingsSave");
 
 // 10) 다크 모드 스크린샷
 await page.emulateMedia({ colorScheme: "dark" });

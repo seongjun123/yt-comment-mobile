@@ -169,3 +169,41 @@ test("공개 검사", () => {
   assert.equal(L.visibilityState("1차 보임 (x) → 2차 안 보임 (y)"), "hidden");
   assert.equal(L.visibilityState(""), "");
 });
+
+test("업로드 기록 · 채널별 중복", () => {
+  const values = [
+    L.RECORD_HEADER,
+    L.recordRow({ at: "2026-10-23 01:00:00", channelId: "UC_BRAND", channelTitle: "또이안이야", vid: "dpjYK2UuYAY", link: "https://www.youtube.com/watch?v=dpjYK2UuYAY&lc=a" }),
+    // 사람이 직접 적은 행: 채널ID·영상ID 없이 채널명 + 영상 주소만
+    ["", "", "또이안이야", "", "", "", "", "https://www.youtube.com/watch?v=HuaGOfzVBiU", ""],
+    ["", "", "", "", "", "", "", "", ""],
+  ];
+  const ix = L.recordIndex(values);
+  assert.equal(ix.count, 2);
+  const brand = { id: "UC_BRAND", title: "또이안이야", handle: "@또이안이야" };
+  const me = { id: "UC_ME", title: "yun sj" };
+  assert.ok(ix.has(brand, "dpjYK2UuYAY"));
+  assert.ok(ix.has(brand, "HuaGOfzVBiU"));          // 채널명으로 매칭
+  assert.equal(ix.has(me, "dpjYK2UuYAY"), null);     // 다른 채널은 한 번 가능
+  assert.equal(ix.has(brand, "_njE1rfRTU0"), null);
+  assert.ok(ix.has({ id: "", title: "", handle: "@또이안이야" }, "dpjYK2UuYAY"));
+  ix.add({ channelId: "UC_ME", channelTitle: "yun sj", vid: "dpjYK2UuYAY" });
+  assert.ok(ix.has(me, "dpjYK2UuYAY"));
+
+  const items = [
+    { kind: "done", vid: "_njE1rfRTU0", postedBy: "또이안이야", postedAt: "t", text: "x", link: "l" },
+    { kind: "done", vid: "_njE1rfRTU0", postedBy: "또이안이야", postedAt: "t", text: "y", link: "l2" },   // 같은 영상 두 번 → 1번만
+    { kind: "done", vid: "dpjYK2UuYAY", postedBy: "또이안이야" },          // 이미 기록됨
+    { kind: "target", vid: "AAAAAAAAAAA", postedBy: "" },
+    { kind: "done", vid: "BBBBBBBBBBB", postedBy: "모르는채널" },
+  ];
+  const miss = L.missingRecordRows(items, ix, { UC_BRAND: { title: "또이안이야" } }, "시트A");
+  assert.deepEqual(miss.map((m) => [m.vid, m.channelId, m.channelTitle, m.sheet]),
+    [["_njE1rfRTU0", "UC_BRAND", "또이안이야", "시트A"], ["BBBBBBBBBBB", "", "모르는채널", "시트A"]]);
+
+  assert.equal(L.toCsv([["a", "b,c"], ['q"q', "줄\n바꿈"]]), '﻿a,"b,c"\r\n"q""q","줄\n바꿈"\r\n');
+  assert.equal(L.safeFileName('a/b:c*?'), "a_b_c__");
+  const files = L.backupFiles(values);
+  assert.deepEqual(Object.keys(files).sort(), ["댓글업로드기록_또이안이야.csv", "댓글업로드기록_전체.csv"]);
+  assert.ok(files["댓글업로드기록_전체.csv"].startsWith("﻿게시시각,채널ID"));
+});

@@ -317,3 +317,97 @@ export function visibilityState(v) {
 export function sheetLabel(ref) {
   return (ref && ref.title) || (ref && ref.id ? ref.id.slice(0, 12) + "…" : "");
 }
+
+// ------------------------------------------------------------------ 업로드 기록 (채널별 중복 방지)
+// 시트 계정 드라이브의 시트 하나에 모든 채널의 게시 기록을 모은다. 중복 기준: (채널 + 영상)
+
+export const RECORD_TITLE = "댓글 업로드 기록 (댓글 도우미)";
+export const RECORD_TAB = "기록";
+export const RECORD_HEADER = ["게시시각", "채널ID", "채널명", "영상ID", "영상 제목", "영상 채널", "댓글", "댓글링크", "원본 시트"];
+
+const normTitle = (t) => String(t || "").trim().replace(/^@/, "").toLowerCase();
+
+/**
+ * 기록 시트 값(1행 머리글 포함) → 색인.
+ * 사람이 직접 적은 행도 읽는다: 채널ID가 비어 있으면 채널명으로, 영상ID가 비어 있으면 댓글링크/영상 주소에서.
+ * 반환 { rows: [{at, channelId, channelTitle, vid, link}], has(ch, vid) → 행|null, count }
+ */
+export function recordIndex(values) {
+  const header = (values[0] || []).map((h) => String(h || "").trim());
+  const col = (name) => header.indexOf(name);
+  const c = { at: col("게시시각"), id: col("채널ID"), title: col("채널명"), vid: col("영상ID"), link: col("댓글링크") };
+  const get = (r, i) => (i >= 0 && r[i] != null ? String(r[i]).trim() : "");
+  const byId = new Map(), byTitle = new Map(), rows = [];
+  for (const r of values.slice(1)) {
+    let vid = extractVideoId(get(r, c.vid)) || extractVideoId(get(r, c.link));
+    if (!vid) for (const cell of r) { vid = extractVideoId(cell); if (vid) break; }   // 영상 주소를 아무 칸에나 적어도
+    const channelId = get(r, c.id), channelTitle = get(r, c.title);
+    if (!vid || (!channelId && !channelTitle)) continue;
+    const row = { at: get(r, c.at), channelId, channelTitle, vid, link: get(r, c.link) };
+    rows.push(row);
+    if (channelId && !byId.has(channelId + "|" + vid)) byId.set(channelId + "|" + vid, row);
+    if (channelTitle && !byTitle.has(normTitle(channelTitle) + "|" + vid)) byTitle.set(normTitle(channelTitle) + "|" + vid, row);
+  }
+  const has = (ch, vid) => {
+    if (!ch || !vid) return null;
+    return (ch.id && byId.get(ch.id + "|" + vid)) || (ch.title && byTitle.get(normTitle(ch.title) + "|" + vid))
+      || (ch.handle && byTitle.get(normTitle(ch.handle) + "|" + vid)) || null;
+  };
+  const add = (row) => {
+    rows.push(row);
+    if (row.channelId) byId.set(row.channelId + "|" + row.vid, row);
+    if (row.channelTitle) byTitle.set(normTitle(row.channelTitle) + "|" + row.vid, row);
+  };
+  return { rows, has, add, get count() { return rows.length; } };
+}
+
+/** 게시 1건 → 기록 시트 한 행 */
+export function recordRow({ at, channelId, channelTitle, vid, title, videoChannel, text, link, sheet }) {
+  return [at || "", channelId || "", channelTitle || "", vid || "", title || "", videoChannel || "", text || "", link || "", sheet || ""];
+}
+
+/**
+ * 업로드 시트의 '게시 완료' 행 중 기록에 없는 것 (기록 기능 전에 올린 것 채우기).
+ * channels: { channelId: {title, handle} } — 게시채널(이름)을 채널ID로 바꾸는 데 쓴다.
+ */
+export function missingRecordRows(items, index, channels, sheetTitle) {
+  const byTitle = new Map(Object.entries(channels || {}).map(([id, c]) => [normTitle(c.title), id]));
+  const out = [], seen = new Set();
+  for (const it of items) {
+    if (it.kind !== "done" || !it.vid || !it.postedBy) continue;
+    const channelId = byTitle.get(normTitle(it.postedBy)) || "";
+    const ch = { id: channelId, title: it.postedBy };
+    const key = (channelId || normTitle(it.postedBy)) + "|" + it.vid;
+    if (index.has(ch, it.vid) || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ at: it.postedAt, channelId, channelTitle: it.postedBy, vid: it.vid, title: it.title, videoChannel: it.channel, text: it.text, link: it.link, sheet: sheetTitle });
+  }
+  return out;
+}
+
+/** 표 → CSV (엑셀에서 한글 깨지지 않게 BOM 포함) */
+export function toCsv(rows) {
+  const cell = (v) => { const s = String(v ?? ""); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  return "﻿" + rows.map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+}
+
+/** 파일 이름에 못 쓰는 글자 제거 */
+export function safeFileName(s) {
+  return String(s || "이름없음").replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim().slice(0, 60) || "이름없음";
+}
+
+/** 기록 시트 값 → 백업 파일들 { 파일이름: CSV } (전체 + 채널별) */
+export function backupFiles(values) {
+  const header = values[0] && values[0].length ? values[0] : RECORD_HEADER;
+  const body = values.slice(1).filter((r) => r.some((x) => String(x ?? "").trim()));
+  const files = { "댓글업로드기록_전체.csv": toCsv([header, ...body]) };
+  const ti = header.indexOf("채널명"), ii = header.indexOf("채널ID");
+  const groups = new Map();
+  for (const r of body) {
+    const name = String(r[ti] || r[ii] || "채널미상").trim();
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(r);
+  }
+  for (const [name, rows] of groups) files[`댓글업로드기록_${safeFileName(name)}.csv`] = toCsv([header, ...rows]);
+  return files;
+}

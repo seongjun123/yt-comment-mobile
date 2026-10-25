@@ -13,7 +13,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="style.css?v=1.4.0">
+  <link rel="stylesheet" href="style.css?v=1.5.0">
 </head>
 <body>
   <header class="topbar">
@@ -152,6 +152,18 @@
       <p class="muted tiny">기본값: 60~120초 무작위 + 가끔 긴 휴식</p>
       <div class="muted small" id="usageText"></div>
       <hr>
+      <div class="field">업로드 기록 <span class="muted small">(채널마다 같은 영상엔 댓글 1번만)</span>
+        <div class="muted small" id="recordText"></div>
+        <div class="row gap-s wrap"><a class="btn ghost small" id="lnkRecord" target="_blank" rel="noopener" hidden>기록 시트 열기</a></div>
+      </div>
+      <div class="field hidden" id="backupField">PC 폴더에 백업 <span class="muted small">(전체 + 채널별 CSV)</span>
+        <div class="muted small" id="backupText"></div>
+        <div class="row gap-s wrap">
+          <button type="button" class="ghost small" id="btnPickFolder">폴더 선택</button>
+          <button type="button" class="ghost small" id="btnBackupNow">지금 백업</button>
+        </div>
+      </div>
+      <hr>
       <div class="row gap wrap">
         <button type="button" class="ghost" id="btnCopyLog">문제 신고용 기록 복사</button>
         <button type="button" class="ghost danger" id="btnLogoutAll">모든 로그인 지우기</button>
@@ -163,6 +175,6 @@
   </dialog>
 
   <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="app.js?v=1.4.0"></script>
+  <script type="module" src="app.js?v=1.5.0"></script>
 </body>
 </html>

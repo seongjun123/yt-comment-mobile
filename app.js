@@ -1,15 +1,17 @@
 // 유튜브 댓글 도우미 (모바일 웹앱)
 // 구조: 서버 없음. 구글 OAuth(리디렉션 방식)로 받은 1시간짜리 토큰으로
 //       Sheets API(읽기/쓰기)와 YouTube Data API(게시)를 브라우저에서 직접 호출한다.
-import * as L from "./lib.js?v=1.4.0";
-import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.4.0";
+import * as L from "./lib.js?v=1.5.0";
+import { CLIENT_ID, APP_VERSION, API_KEY } from "./config.js?v=1.5.0";
 
 const $ = (id) => document.getElementById(id);
 const REDIRECT_URI = location.origin + location.pathname.replace(/[^/]*$/, "");
 const SCOPE_SHEETS = "https://www.googleapis.com/auth/spreadsheets";
 const SCOPE_YT = "https://www.googleapis.com/auth/youtube.force-ssl";
-const SCOPE_CHANNEL = `openid email ${SCOPE_YT} ${SCOPE_SHEETS}`;
-const SCOPE_SHEET_ONLY = `openid email ${SCOPE_SHEETS}`;
+const SCOPE_DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";   // 이 앱이 만든 '업로드 기록' 시트를 찾는 데만 씀
+const SCOPE_CHANNEL = `openid email ${SCOPE_YT} ${SCOPE_SHEETS} ${SCOPE_DRIVE_FILE}`;
+const SCOPE_SHEET_ONLY = `openid email ${SCOPE_SHEETS} ${SCOPE_DRIVE_FILE}`;
+const DRIVE = "https://www.googleapis.com/drive/v3/files";
 const SHEETS = "https://sheets.googleapis.com/v4/spreadsheets";
 const YT = "https://www.googleapis.com/youtube/v3";
 const RENEW_MARGIN_MS = 3 * 60 * 1000;   // 만료 3분 전이면 갱신
@@ -70,8 +72,10 @@ const valid = (t) => t && t.token && t.exp - now() > 60 * 1000;
 const channel = () => (S.current ? S.channels[S.current] : null);
 const isRealEmail = (e) => !!e && !/pages\.plusgoogle\.com$/i.test(e);
 
-// 시트용 토큰: 전용 시트 로그인이 있으면 그것, 없으면 (본계정 채널일 때) 채널 토큰
+// 시트용 토큰: '시트 저장 계정'이 정해져 있으면 그 계정만 쓴다 (만료돼도 다른 계정으로 대신하지 않음 —
+// 업로드 기록이 여러 계정에 나뉘는 것을 막기 위해). 아직 안 정했을 때만 본계정 채널 토큰을 쓴다.
 function sheetToken() {
+  if (S.sheetAuth && S.sheetAuth.email) return valid(S.sheetAuth) ? S.sheetAuth : null;
   if (valid(S.sheetAuth)) return S.sheetAuth;
   const ch = channel();
   if (ch && isRealEmail(ch.email) && valid(ch)) return { token: ch.token, exp: ch.exp, email: ch.email };
@@ -181,7 +185,8 @@ async function finishLogin(r) {
   S.wrongChannel = !!wrongChannel;
   if (!wrongChannel) S.current = ch.id;
   // 본계정 채널로 로그인했고 시트 권한이 있으면 시트 계정도 같이 채운다
-  if (isRealEmail(email) && r.scopes.includes(SCOPE_SHEETS) && (!valid(S.sheetAuth) || S.sheetAuth.email === email)) {
+  // 시트 저장 계정은 처음 한 번만 자동으로 정하고, 그 뒤엔 같은 계정일 때만 토큰을 새로 고친다 ([변경]으로만 바뀜)
+  if (isRealEmail(email) && r.scopes.includes(SCOPE_SHEETS) && (!S.sheetAuth || !S.sheetAuth.email || S.sheetAuth.email === email)) {
     S.sheetAuth = { token: r.token, exp: r.exp, email, sub };
   }
   persist();
@@ -535,6 +540,199 @@ async function runCheck(id) {
   }
 }
 
+// ------------------------------------------------------------------ 업로드 기록 (채널별 중복 방지)
+// 시트 계정 드라이브의 '댓글 업로드 기록' 시트 하나에 모든 채널의 게시를 모은다.
+// 폰·PC 어디서 올려도 같은 시트를 보므로, 한 채널이 같은 영상에 두 번 다는 것을 막는다.
+function recordCache() {
+  const r = store.get("record", null), st = sheetToken();
+  return r && st && r.email === st.email ? r : null;
+}
+
+async function findOrCreateRecord({ create = true } = {}) {
+  const st = sheetToken();
+  if (!st) { const e = new ApiError(401, ""); e.sheet = true; throw e; }
+  const cached = recordCache();
+  if (cached) return cached.id;
+  const q = `name = '${L.RECORD_TITLE}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`;
+  const res = await withSheet(`${DRIVE}?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=createdTime&spaces=drive&pageSize=10`);
+  let id = res.files && res.files[0] && res.files[0].id;
+  if (!id) {
+    if (!create) return null;
+    const ok = await confirmDialog("업로드 기록 시트 만들기",
+      `<div><b>${esc(st.email || "시트 저장 계정")}</b> 드라이브에 '${esc(L.RECORD_TITLE)}' 시트를 새로 만듭니다.</div>
+       <div class="muted small">모든 채널의 게시 기록이 여기 모이고, 채널마다 같은 영상엔 댓글을 한 번만 달게 막습니다.</div>
+       <div class="warnline">다른 구글 계정에 이미 기록 시트가 있다면 [취소] 후 '시트 저장 계정'을 그 계정으로 바꾸세요.</div>`, "만들기");
+    if (!ok) throw new Error("업로드 기록 시트를 만들지 않았습니다");
+    const made = await withSheet(SHEETS, { method: "POST", body: {
+      properties: { title: L.RECORD_TITLE, locale: "ko_KR", timeZone: "Asia/Seoul" },
+      sheets: [{ properties: { title: L.RECORD_TAB, gridProperties: { frozenRowCount: 1, columnCount: L.RECORD_HEADER.length } } }],
+    } });
+    id = made.spreadsheetId;
+    await withSheet(`${SHEETS}/${id}/values/A1?valueInputOption=RAW`, { method: "PUT", body: { values: [L.RECORD_HEADER] } });
+    log("기록 시트 생성", id);
+    toast(`업로드 기록 시트를 만들었습니다 (${st.email || "시트 계정"} 드라이브)`, 5000);
+  }
+  store.set("record", { email: st.email, id });
+  return id;
+}
+
+/** 기록 시트를 읽어 색인을 만든다 (못 올린 기록이 이 기기에 남아 있으면 먼저 올림) */
+async function loadRecord({ create = true } = {}) {
+  let id = await findOrCreateRecord({ create });
+  if (!id) return null;
+  let data;
+  try { data = await withSheet(`${SHEETS}/${id}/values/A1:Z?majorDimension=ROWS`); }
+  catch (e) {
+    if (!(e instanceof ApiError && (e.status === 404 || e.status === 403))) throw e;
+    store.del("record");                        // 지워졌거나 접근 불가 → 다시 찾기
+    id = await findOrCreateRecord({ create });
+    if (!id) return null;
+    data = await withSheet(`${SHEETS}/${id}/values/A1:Z?majorDimension=ROWS`);
+  }
+  const values = data.values || [];
+  if (!values.length) {
+    await withSheet(`${SHEETS}/${id}/values/A1?valueInputOption=RAW`, { method: "PUT", body: { values: [L.RECORD_HEADER] } });
+    values.push([...L.RECORD_HEADER]);
+  }
+  S.record = { id, values, index: null };
+  const pending = store.get("recordPending", []);
+  if (pending.length) {
+    try { await appendValues(pending); values.push(...pending); store.del("recordPending"); log("보류된 기록 올림", pending.length); }
+    catch (e) { log("보류된 기록 올리기 실패", e.message); }
+  }
+  S.record.index = L.recordIndex([...values, ...store.get("recordPending", [])]);
+  S.recordError = "";
+  return S.record;
+}
+
+const appendValues = (vals) => withSheet(`${SHEETS}/${S.record.id}/values/A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+  { method: "POST", body: { values: vals } });
+
+/** 기록 추가. 실패해도 이 기기에 보관했다가 다음에 올리고, 중복 판정에는 바로 반영 */
+async function appendRecord(rows) {
+  if (!rows.length || !S.record) return;
+  const vals = rows.map(L.recordRow);
+  let saved = false;
+  for (let i = 0; i < 3 && !saved; i++) {
+    try { await appendValues(vals); saved = true; }
+    catch (e) { if (!e.network || i === 2) { log("기록 저장 실패(보류)", e.message); break; } await sleep(1500 * (i + 1)); }
+  }
+  if (saved) S.record.values.push(...vals);
+  else store.set("recordPending", store.get("recordPending", []).concat(vals));
+  for (const r of rows) S.record.index.add(r);
+}
+
+/** 업로드 시트의 '게시 완료' 행 중 기록에 없는 것을 채운다 (기록 기능 전에 올린 것) */
+async function backfillRecord() {
+  if (!S.record || !S.sheet || S.sheet.error) return 0;
+  const miss = L.missingRecordRows(S.sheet.items, S.record.index, S.channels, S.sheet.title);
+  if (miss.length) { await appendRecord(miss); log("기존 게시 기록 채움", miss.length); }
+  return miss.length;
+}
+
+function recordFail(e) {
+  S.recordError = e.message;
+  if (e instanceof ApiError && (e.code === "scope" || e.status === 401 || e.status === 403)) {
+    showAuthBanner("sheet");
+    toast("업로드 기록(중복 방지)에 권한이 하나 더 필요합니다. [시트 계정 로그인]을 눌러 모두 허용해주세요.", 7000);
+  } else toast(`업로드 기록을 불러오지 못했습니다: ${e.message}`, 6000);
+  log("업로드 기록 오류", e.message);
+}
+
+/** 화면 표시용: 시트를 불러온 뒤 조용히 기록도 맞춘다 */
+async function syncRecord() {
+  if (!sheetToken()) return;
+  try { if (await loadRecord({ create: false })) { await backfillRecord(); backupNow(); } }
+  catch (e) { S.recordError = e.message; log("기록 동기화 실패", e.message); }
+  render();
+}
+
+const currentChannelRef = () => { const c = channel(); return c ? { id: S.current, title: c.title, handle: c.handle } : null; };
+const alreadyPosted = (vid) => (S.record && S.record.index ? S.record.index.has(currentChannelRef(), vid) : null);
+
+// ------------------------------------------------------------------ PC 폴더 백업 (PC 크롬·웨일에서만)
+// 처음 한 번 폴더를 고르고 권한을 허용하면, 앱을 열 때·게시가 끝날 때 기록을 CSV로 저장한다 (전체 + 채널별).
+const FS_OK = typeof window.showDirectoryPicker === "function";
+const idb = {
+  open() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open("ytm", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("kv");
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  },
+  async get(k) {
+    const db = await this.open();
+    return new Promise((res, rej) => { const q = db.transaction("kv").objectStore("kv").get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
+  },
+  async set(k, v) {
+    const db = await this.open();
+    return new Promise((res, rej) => { const t = db.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  },
+};
+const B = { dir: null, needPerm: false, busy: false, warned: false };
+
+async function loadBackupDir() {
+  if (!FS_OK) return;
+  try { B.dir = (await idb.get("backupDir")) || null; } catch { B.dir = null; }
+}
+
+async function pickBackupFolder() {
+  let h;
+  try { h = await window.showDirectoryPicker({ id: "ytm-backup", mode: "readwrite", startIn: "desktop" }); }
+  catch { return; }   // 취소
+  B.dir = h;
+  try { await idb.set("backupDir", h); } catch (e) { log("백업 폴더 저장 실패", e.message); }
+  await backupNow({ manual: true });
+}
+
+async function backupNow({ manual = false } = {}) {
+  if (!B.dir || B.busy) return false;
+  if (!S.record) { if (manual) { try { await loadRecord(); } catch (e) { recordFail(e); return false; } } else return false; }
+  B.busy = true;
+  try {
+    let perm = await B.dir.queryPermission({ mode: "readwrite" });
+    if (perm !== "granted" && manual) perm = await B.dir.requestPermission({ mode: "readwrite" });
+    if (perm !== "granted") {
+      B.needPerm = true;
+      if (!B.warned) { B.warned = true; toast("PC 백업: 설정 → [지금 백업]을 눌러 폴더 권한을 다시 허용해주세요", 6000); }
+      return false;
+    }
+    const files = L.backupFiles([...S.record.values, ...store.get("recordPending", [])]);
+    for (const [name, text] of Object.entries(files)) {
+      const fh = await B.dir.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(text); await w.close();
+    }
+    B.needPerm = false;
+    store.set("backupAt", L.kstStamp());
+    if (manual) toast(`'${B.dir.name}' 폴더에 기록 ${Object.keys(files).length}개 파일을 저장했습니다`);
+    log("PC 백업", B.dir.name, Object.keys(files).length);
+    return true;
+  } catch (e) {
+    log("PC 백업 실패", e.message);
+    if (manual) toast(`PC 백업 실패: ${e.message}`, 5000);
+    return false;
+  } finally { B.busy = false; renderSettingsInfo(); }
+}
+
+function renderSettingsInfo() {
+  const rt = $("recordText"); if (!rt) return;
+  const r = recordCache();
+  if (S.record) rt.textContent = `기록 ${S.record.index.count}건 · 저장 계정 ${sheetToken() ? sheetToken().email : ""}` + (store.get("recordPending", []).length ? ` · 올리지 못한 기록 ${store.get("recordPending", []).length}건 보관 중` : "");
+  else rt.textContent = S.recordError ? `불러오지 못함: ${S.recordError}` : "아직 불러오지 않음 (시트를 불러오면 자동으로 연결)";
+  const lnk = $("lnkRecord");
+  const id = (S.record && S.record.id) || (r && r.id);
+  lnk.hidden = !id; if (id) lnk.href = `https://docs.google.com/spreadsheets/d/${id}/edit`;
+  $("backupField").classList.toggle("hidden", !FS_OK);
+  if (FS_OK) {
+    const at = store.get("backupAt", "");
+    $("backupText").textContent = !B.dir ? "폴더를 아직 고르지 않았습니다 (바탕화면 › 확인할 작업물 추천)"
+      : `${B.dir.name} 폴더` + (B.needPerm ? " · 권한 다시 허용 필요 → [지금 백업]" : "") + (at ? ` · 마지막 저장 ${at.slice(5, 16).replace("-", "/")}` : "");
+    $("btnBackupNow").disabled = !B.dir;
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const todayUsage = () => S.usage[L.quotaDayKey()] || 0;
 function addUsage() {
@@ -603,6 +801,12 @@ async function startRun({ resumed = false } = {}) {
     store.del("run");
   }
 
+  // 0) 업로드 기록 (채널별 중복 방지) — 못 불러오면 게시하지 않는다
+  setRunText("업로드 기록 확인 중…");
+  try { await loadRecord(); await backfillRecord(); }
+  catch (e) { recordFail(e); setRunText("업로드 기록을 불러오지 못해 게시하지 않았습니다"); return; }
+  const me = currentChannelRef();
+
   // 1) 게시 중으로 남은 행 정리
   const orphans = S.sheet.items.filter((i) => i.kind === "orphan");
   if (orphans.length) {
@@ -613,6 +817,7 @@ async function startRun({ resumed = false } = {}) {
         if (id) {
           await writeRow(it.row, { "상태": L.STATUS.DONE, "댓글링크": `${L.videoUrl(it.vid)}&lc=${id}`, "게시채널": ch.title, "오류": "" });
           it.kind = "done";
+          if (!alreadyPosted(it.vid)) await appendRecord([{ at: it.postedAt || L.kstStamp(), channelId: S.current, channelTitle: ch.title, vid: it.vid, title: it.title, videoChannel: it.channel, text: it.text, link: `${L.videoUrl(it.vid)}&lc=${id}`, sheet: S.sheet.title }]);
         } else { it.kind = "target"; }
       } catch (e) { log("끊긴 행 확인 실패", it.row, e.message); it.kind = "target"; }
     }
@@ -620,6 +825,23 @@ async function startRun({ resumed = false } = {}) {
 
   let queue = S.sheet.items.filter((i) => i.kind === "target" || i.kind === "fail");
   if (!queue.length) { render(); toast("게시할 행이 없습니다"); return; }
+
+  // 1-2) 이 채널로 이미 댓글 단 영상 / 시트 안에서 같은 영상 반복 → 건너뜀
+  await ensureManagedColumns();
+  const already = [], repeated = [];
+  const seenVid = new Set();
+  for (const it of queue) {
+    const prev = S.record.index.has(me, it.vid);
+    const when = prev && /^\d{4}-\d\d-\d\d \d\d:\d\d/.test(prev.at) ? ` (${prev.at.slice(5, 16).replace("-", "/")})` : "";
+    const why = prev ? `${ch.title} 채널로 이미 댓글 단 영상${when}` : seenVid.has(it.vid) ? `같은 영상이 위 행에 또 있음 (채널당 1번만)` : "";
+    seenVid.add(it.vid);
+    if (!why) continue;
+    (prev ? already : repeated).push(it);
+    await writeRow(it.row, { "상태": L.STATUS.SKIP, "오류": why }).catch(() => {});
+    it.kind = "skip"; it.status = L.STATUS.SKIP; it.error = why;
+  }
+  queue = queue.filter((i) => i.kind !== "skip");
+  if (!queue.length) { render(); toast(`게시할 행이 없습니다 (이미 단 영상 ${already.length + repeated.length}개 건너뜀)`, 5000); return; }
 
   // 2) 영상 사전 확인
   setRunText("영상 확인 중…");
@@ -651,6 +873,8 @@ async function startRun({ resumed = false } = {}) {
     let html = `<div><b>${esc(ch.title)}</b> 채널로 댓글 <b>${queue.length}개</b>를 게시합니다.</div>
       <div class="muted small">시트: ${esc(S.sheet.title)} · 예상 약 ${mins}분 (간격 ${S.delay.lo}~${S.delay.hi}초${S.longPause ? ", 가끔 180~240초" : ""})</div>
       <div class="muted small">끝날 때까지 이 화면을 켜두세요.</div>`;
+    if (already.length) html += `<div class="muted small">이 채널로 이미 댓글 단 영상 ${already.length}개는 '건너뜀'으로 표시했습니다.</div>`;
+    if (repeated.length) html += `<div class="muted small">시트 안에서 같은 영상이 반복된 ${repeated.length}개는 첫 행만 게시하고 나머지는 '건너뜀'으로 표시했습니다.</div>`;
     if (skipped.length) html += `<div class="muted small">댓글 꺼짐·없는 영상 ${skipped.length}개는 '건너뜀'으로 표시했습니다.</div>`;
     if (queue.length > left) html += `<div class="warnline">오늘 남은 한도(약 ${left}개, 이 기기 기준)보다 많습니다. 한도에 닿으면 자동으로 멈춥니다.</div>`;
     if (reps.length) html += `<div class="warnline">같은 댓글이 여러 영상에 반복됩니다 (${reps.slice(0, 2).map((t) => "“" + esc(t.slice(0, 15)) + "”").join(", ")}). 스팸으로 걸러질 수 있습니다.</div>`;
@@ -669,6 +893,10 @@ async function startRun({ resumed = false } = {}) {
       if (S.stopReq) break;
       if (renewIfNeeded()) return;           // 로그인 갱신하러 이동 → 돌아오면 자동으로 이어감
       const it = queue[i];
+      if (alreadyPosted(it.vid)) {             // 실행 도중 다른 기기에서 단 경우 등 (마지막 안전장치)
+        await writeRow(it.row, { "상태": L.STATUS.SKIP, "오류": `${ch.title} 채널로 이미 댓글 단 영상` }).catch(() => {});
+        it.kind = "skip"; S.processed.push(it.row); continue;
+      }
       S.postingRow = it.row;
       setProgress(i, total, `${i + 1}/${total} 게시 중…`);
       render();
@@ -677,6 +905,7 @@ async function startRun({ resumed = false } = {}) {
         const id = await postComment(it.vid, it.text);
         addUsage();
         const fields = { "상태": L.STATUS.DONE, "게시시각": L.kstStamp(), "댓글링크": `${L.videoUrl(it.vid)}&lc=${id}`, "게시채널": ch.title, "오류": "" };
+        await appendRecord([{ at: fields["게시시각"], channelId: S.current, channelTitle: ch.title, vid: it.vid, title: it.title, videoChannel: it.channel, text: it.text, link: fields["댓글링크"], sheet: S.sheet.title }]);
         try { await writeRow(it.row, fields); }
         catch (e) {
           // 게시는 됐는데 시트 기록 실패 → 중복 방지를 위해 여기서 멈춤
@@ -734,6 +963,7 @@ async function startRun({ resumed = false } = {}) {
   else if (stopped) html += `<div class="muted small">중지했습니다. 다시 시작하면 남은 행만 이어서 게시합니다.</div>`;
   html += `<div class="muted small">'게시 완료'는 유튜브가 받아들였다는 뜻입니다. 다른 사람에게 보이는지는 시크릿 창에서 확인하세요.</div>`;
   render();
+  backupNow();
   await confirmDialog("결과", html, "확인", { info: true });
   loadSheet().catch(() => {});
 }
@@ -788,11 +1018,16 @@ function renderAccount() {
 
   const sa = $("sheetAuth");
   const st = sheetToken();
-  if (st) sa.innerHTML = `시트 계정: ${esc(st.email || "로그인됨")}`;
-  else if (ch) sa.innerHTML = `시트 계정: 없음 <button class="small" id="btnSheetLogin">시트 계정 로그인</button>`;
+  const fixed = S.sheetAuth && S.sheetAuth.email;
+  if (st) sa.innerHTML = `시트 저장 계정: <b>${esc(st.email || "로그인됨")}</b> <button class="ghost small" id="btnSheetLogin">변경</button>`;
+  else if (fixed) sa.innerHTML = `시트 저장 계정: <b>${esc(fixed)}</b> · 로그인 갱신 필요 <button class="small" id="btnSheetLogin">로그인</button>`;
+  else if (ch) sa.innerHTML = `시트 저장 계정: 없음 <button class="small" id="btnSheetLogin">시트 저장 계정 로그인</button>`;
   else sa.innerHTML = "";
   const b2 = $("btnSheetLogin");
-  if (b2) b2.onclick = () => startLogin("sheet");
+  if (b2) b2.onclick = () => {
+    if (st && !window.confirm("시트 저장 계정을 바꿀까요?\n업로드 기록 시트는 계정마다 따로라서, 다른 계정으로 바꾸면 그 계정의 기록 시트를 씁니다.")) return;
+    startLogin("sheet", { hint: st ? "" : (fixed || "") });
+  };
   if (!S.needLogin) $("authBanner").classList.add("hidden");
 }
 
@@ -816,7 +1051,8 @@ function renderSheets() {
   const c = sh.counts;
   const chip = (label, n) => (n ? `<span class="chip">${label} <b>${n}</b></span>` : "");
   sum.innerHTML = `<span class="chip">📄 ${esc(sh.tab)}</span>` + chip("대기", c.target + c.fail + c.orphan) + chip("완료", c.done)
-    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty);
+    + chip("건너뜀", c.skip + c.dup) + chip("주소 오류", c.invalid) + chip("댓글 없음", c.empty)
+    + chip("이 채널로 이미 단 영상", sh.items.filter((i) => (i.kind === "target" || i.kind === "fail") && alreadyPosted(i.vid)).length);
   const reps = L.repeatedTexts(sh.items);
   if (reps.length) {
     w.textContent = `같은 댓글이 여러 영상에 반복됩니다 (“${reps[0].slice(0, 20)}”${reps.length > 1 ? ` 외 ${reps.length - 1}개` : ""}). 스팸으로 걸러질 가능성이 높습니다.`;
@@ -844,7 +1080,8 @@ function renderList() {
     : "아직 없습니다.";
   list.innerHTML = items.slice(0, 300).map((it) => {
     const posting = it.row === S.postingRow;
-    const [label, cls] = posting ? ["게시 중", "run"] : KIND_BADGE[it.kind] || [it.kind, ""];
+    const dupe = (it.kind === "target" || it.kind === "fail") && alreadyPosted(it.vid);
+    const [label, cls] = posting ? ["게시 중", "run"] : dupe ? ["이미 단 영상", "fail"] : KIND_BADGE[it.kind] || [it.kind, ""];
     const title = it.title || it.url;
     const link = it.link ? ` · <a href="${esc(it.link)}" target="_blank" rel="noopener">댓글 보기</a>` : "";
     const err = it.error && it.kind !== "done" ? ` · ${esc(it.error)}` : "";
@@ -1002,6 +1239,7 @@ function bind() {
     $("inpLo").value = S.delay.lo; $("inpHi").value = S.delay.hi; $("chkLong").checked = S.longPause;
     $("usageText").textContent = `오늘 이 기기에서 게시: ${todayUsage()}개 · 하루 한도 약 ${DAILY_LIMIT}개 (오후 4~5시경 초기화)`;
     $("verText").textContent = `버전 ${APP_VERSION}`;
+    renderSettingsInfo();
     $("dlgSettings").showModal();
   };
   $("btnSettingsSave").onclick = () => {
@@ -1009,6 +1247,8 @@ function bind() {
     const hi = Math.max(0, Math.min(3600, parseInt($("inpHi").value, 10) || 0));
     S.delay = { lo: Math.min(lo, hi), hi: Math.max(lo, hi) }; S.longPause = $("chkLong").checked; persist();
   };
+  $("btnPickFolder").onclick = () => pickBackupFolder();
+  $("btnBackupNow").onclick = () => backupNow({ manual: true });
   $("btnCopyLog").onclick = async () => {
     const text = [`버전 ${APP_VERSION}`, navigator.userAgent, ...logLines].join("\n");
     try { await navigator.clipboard.writeText(text); toast("기록을 복사했습니다"); }
@@ -1032,7 +1272,7 @@ function bind() {
 }
 
 async function safeLoad() {
-  try { await loadSheet(); }
+  try { await loadSheet(); syncRecord(); }
   catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       showAuthBanner(e.sheet && channel() && valid(channel()) ? "sheet" : "channel");
@@ -1048,6 +1288,7 @@ async function safeLoad() {
 // ------------------------------------------------------------------ 시작
 async function boot() {
   bind();
+  await loadBackupDir();
   render();
   const r = readOAuthReturn();
   if (r) {
